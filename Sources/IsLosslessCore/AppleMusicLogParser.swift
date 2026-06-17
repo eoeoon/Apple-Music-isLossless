@@ -4,18 +4,53 @@ public struct AppleMusicLogParser: Sendable {
     public init() {}
 
     public func parse(_ message: String) -> AudioFormat? {
+        guard isSourceFormatMessage(message) else {
+            return nil
+        }
+
+        let codec = parseCodec(in: message)
         let bitDepth = parseBitDepth(in: message)
         let sampleRate = parseSampleRate(in: message)
-        let format = AudioFormat(bitDepth: bitDepth, sampleRate: sampleRate)
+        let format = AudioFormat(codec: codec, bitDepth: bitDepth, sampleRate: sampleRate)
         return format.isEmpty ? nil : format
+    }
+
+    private func parseCodec(in message: String) -> String? {
+        let lowercasedMessage = message.lowercased()
+
+        if lowercasedMessage.contains("applelossless")
+            || lowercasedMessage.contains("alac")
+            || lowercasedMessage.contains("lossless")
+            || lowercasedMessage.contains("rendition lossless") {
+            return "ALAC"
+        }
+
+        if lowercasedMessage.contains("aac") {
+            return "AAC"
+        }
+
+        return nil
+    }
+
+    private func isSourceFormatMessage(_ message: String) -> Bool {
+        let lowercasedMessage = message.lowercased()
+        return lowercasedMessage.contains("input format")
+            || lowercasedMessage.contains("source format")
+            || lowercasedMessage.contains("bit source")
+            || lowercasedMessage.contains("rendition lossless")
+            || lowercasedMessage.contains("audio-alac")
+            || lowercasedMessage.contains("[alac]")
+            || lowercasedMessage.contains("_lossless.m3u8")
+            || lowercasedMessage.contains("pbaudioformat.lossless")
+            || lowercasedMessage.contains("activeformat:")
     }
 
     private func parseBitDepth(in message: String) -> Int? {
         let patterns = [
             #"(\d{2})\s*-?\s*bit\s+source"#,
             #"(\d{2})\s*-?\s*bit"#,
-            #"bitDepth\D+(\d{2})"#,
-            #"sdBitDepth\D+(\d{2})"#
+            #"BitDepth\D+(\d{2})"#,
+            #"audio-alac-[^\s\]]*-\d+-(\d{2})"#
         ]
 
         return firstIntegerMatch(in: message, patterns: patterns)
@@ -24,11 +59,16 @@ public struct AppleMusicLogParser: Sendable {
     private func parseSampleRate(in message: String) -> Double? {
         let patterns = [
             #"(\d+(?:\.\d+)?)\s*Hz"#,
-            #"sampleRate\D+(\d+(?:\.\d+)?)"#,
-            #"asbdSampleRate\D+(\d+(?:\.\d+)?)"#
+            #"(\d+(?:\.\d+)?)\s*kHz"#,
+            #"SampleRate\D+(\d+(?:\.\d+)?)"#,
+            #"audio-alac-[^\s\]]*-(\d+)-\d{2}"#
         ]
 
-        return firstDoubleMatch(in: message, patterns: patterns)
+        guard let sampleRate = firstDoubleMatch(in: message, patterns: patterns) else {
+            return nil
+        }
+
+        return sampleRate < 1_000 ? sampleRate * 1_000 : sampleRate
     }
 
     private func firstIntegerMatch(in message: String, patterns: [String]) -> Int? {
