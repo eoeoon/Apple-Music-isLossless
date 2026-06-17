@@ -4,30 +4,32 @@ public struct MenuBarTitleFormatter: Sendable {
     public init() {}
 
     public func title(for format: AudioFormat?, status: DetectionStatus) -> String {
+        if let format, !format.isEmpty {
+            return detectedTitle(for: format)
+        }
+
         switch status {
         case .detected:
-            guard let format, !format.isEmpty else { return "—" }
-            return detectedTitle(for: format)
-        case .detecting:
-            return "확인 중"
-        default:
             return "—"
+        case .detecting:
+            return "—"
+        default:
+            return "isLossless"
         }
     }
 
     public func detectedTitle(for format: AudioFormat) -> String {
-        let sampleRateText = format.sampleRate.map(formatSampleRate)
-
-        switch (format.bitDepth, sampleRateText) {
-        case let (.some(bitDepth), .some(sampleRateText)):
-            return "\(bitDepth)비트 \(sampleRateText)"
-        case let (.none, .some(sampleRateText)):
-            return sampleRateText
-        case let (.some(bitDepth), .none):
-            return "\(bitDepth)비트"
-        case (.none, .none):
-            return "—"
+        if format.codec == "AAC" {
+            let parts = [format.codec, format.bitRate.map { "\($0)kbps" }].compactMap { $0 }
+            return parts.isEmpty ? "—" : parts.joined(separator: " ")
         }
+
+        let bitRateText = format.bitRate.map { "\($0)kbps" }
+        let bitDepthText = format.bitDepth.map { "\($0)비트" }
+        let sampleRateText = format.sampleRate.map(formatSampleRate)
+        let parts = [format.codec, bitDepthText, bitRateText, sampleRateText].compactMap { $0 }
+
+        return parts.isEmpty ? "—" : parts.joined(separator: " ")
     }
 
     public func formatSampleRate(_ hertz: Double) -> String {
