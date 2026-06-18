@@ -41,7 +41,6 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         static let columnSpacing: CGFloat = 12
         static let analysisIconTextSpacing: CGFloat = 7
         static let analysisDetailRowHeight: CGFloat = 17
-        static let actionRowHeight: CGFloat = 26
         static let headerFontSize: CGFloat = 14
         static let bodyFontSize: CGFloat = 13
         static let analysisIconTextGap: CGFloat = 6
@@ -171,11 +170,13 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
            let detail = iconProvider.detailText(for: state.format, formatter: formatter) {
             button.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .regular)
             let title = iconProvider.titleBeforeIcon(for: detail)
-            statusItem.length = iconProvider.itemLength(for: icon, title: title, font: button.font ?? .systemFont(ofSize: NSFont.systemFontSize))
-            button.title = title
-            button.image = icon
-            button.imagePosition = .imageRight
-            button.imageScaling = .scaleProportionallyDown
+            let statusImage = iconProvider.statusImage(for: icon, title: title, font: button.font ?? .systemFont(ofSize: NSFont.systemFontSize))
+            statusItem.length = iconProvider.itemLength(for: statusImage)
+            button.title = ""
+            button.image = statusImage
+            button.imagePosition = .imageOnly
+            button.imageHugsTitle = true
+            button.imageScaling = .scaleNone
             button.contentTintColor = nil
         } else {
             let title = formatter.title(for: state.format, status: state.status)
@@ -184,12 +185,14 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 button.title = ""
                 button.image = icon
                 button.imagePosition = .imageOnly
+                button.imageHugsTitle = true
                 button.imageScaling = .scaleProportionallyDown
                 button.contentTintColor = nil
             } else {
                 statusItem.length = NSStatusItem.variableLength
                 button.image = nil
                 button.title = title
+                button.imageHugsTitle = true
                 button.contentTintColor = nil
             }
         }
@@ -227,19 +230,26 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(headerItem())
         menu.addItem(analysisItem())
+        guard state.playbackStatus != .notRunning else {
+            menu.addItem(.separator())
+            menu.addItem(quitMenuItem())
+            return
+        }
+
         menu.addItem(.separator())
         menu.addItem(informationalItem("출력", key: "output-title", secondary: true, compact: true))
         menu.addItem(informationalItem(outputText, key: "output", emphasized: false, compact: true))
+
         menu.addItem(.separator())
-        menu.addItem(refreshMenuItem())
-        menu.addItem(actionMenuItem(
-            title: "종료",
-            systemSymbolName: "xmark.square",
-            shortcut: "⌘Q",
-            target: NSApp,
-            action: #selector(NSApplication.terminate(_:)),
-            keyEquivalent: "q"
-        ))
+        let refreshItem = NSMenuItem(title: "새로 고침", action: #selector(manualRefresh), keyEquivalent: "r")
+        refreshItem.target = self
+        if let image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "새로 고침") {
+            image.isTemplate = true
+            refreshItem.image = image
+        }
+        menu.addItem(refreshItem)
+
+        menu.addItem(quitMenuItem())
     }
 
     private func updateMenuLabels() {
@@ -250,6 +260,12 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         synchronizedSlidingGroups["track-metadata"]?.restart()
         menuImageViews["analysis-detail-icon"]?.image = analysisDetailIcon
         menuLabels["output"]?.stringValue = outputText
+    }
+
+    private func quitMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        item.target = NSApp
+        return item
     }
 
     private func headerItem() -> NSMenuItem {
@@ -384,46 +400,6 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let key {
             menuLabels[key] = label
         }
-        return item
-    }
-
-    private func refreshMenuItem() -> NSMenuItem {
-        actionMenuItem(
-            title: "새로 고침",
-            systemSymbolName: "arrow.clockwise",
-            shortcut: "⌘R",
-            target: self,
-            action: #selector(manualRefresh),
-            keyEquivalent: "r"
-        )
-    }
-
-    private func actionMenuItem(
-        title: String,
-        systemSymbolName: String,
-        shortcut: String,
-        target: AnyObject?,
-        action: Selector,
-        keyEquivalent: String
-    ) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
-        item.target = target
-        item.view = menuItemView(
-            arrangedSubviews: [
-                MenuActionRowView(
-                    title: title,
-                    systemSymbolName: systemSymbolName,
-                    shortcut: shortcut,
-                    width: MenuLayout.contentWidth,
-                    height: MenuLayout.actionRowHeight,
-                    fontSize: MenuLayout.bodyFontSize,
-                    target: target,
-                    action: action
-                )
-            ],
-            topInset: 1,
-            bottomInset: 1
-        )
         return item
     }
 
@@ -563,6 +539,10 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 }
 
 private struct MenuBarIconProvider {
+    private static let leadingPadding: CGFloat = 0
+    private static let trailingPadding: CGFloat = 1
+    private static let statusImageHeight: CGFloat = 18
+    private static let iconVerticalOffset: CGFloat = -1
     private let losslessIcon = Self.loadIcon(named: "isLossless_logo_black", targetHeight: 14)
     private let otherIcon = Self.loadIcon(named: "isLossless_logo_crossed_black", targetHeight: 14)
     private let menuLosslessIcon = Self.loadIcon(named: "isLossless_logo_black", targetHeight: 36)
@@ -608,9 +588,39 @@ private struct MenuBarIconProvider {
         "\(detail)  "
     }
 
-    func itemLength(for icon: NSImage, title: String, font: NSFont) -> CGFloat {
-        let textWidth = (title as NSString).size(withAttributes: [.font: font]).width
-        return max(24, (icon.size.width + textWidth + 8).rounded(.up))
+    func statusImage(for icon: NSImage, title: String, font: NSFont) -> NSImage {
+        let text = title as NSString
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.black
+        ]
+        let textSize = text.size(withAttributes: attributes)
+        let textWidth = ceil(textSize.width)
+        let imageWidth = ceil(Self.leadingPadding + textWidth + icon.size.width + Self.trailingPadding)
+        let imageSize = NSSize(width: imageWidth, height: Self.statusImageHeight)
+        let image = NSImage(size: imageSize)
+
+        image.lockFocus()
+        NSColor.clear.setFill()
+        NSRect(origin: .zero, size: imageSize).fill()
+
+        let textY = ((Self.statusImageHeight - textSize.height) / 2).rounded(.down)
+        text.draw(at: NSPoint(x: Self.leadingPadding, y: textY), withAttributes: attributes)
+
+        let iconY = ((Self.statusImageHeight - icon.size.height) / 2).rounded(.down) + Self.iconVerticalOffset
+        icon.draw(
+            in: NSRect(x: Self.leadingPadding + textWidth, y: iconY, width: icon.size.width, height: icon.size.height),
+            from: NSRect(origin: .zero, size: icon.size),
+            operation: .sourceOver,
+            fraction: 1
+        )
+        image.unlockFocus()
+        image.isTemplate = true
+        return image
+    }
+
+    func itemLength(for image: NSImage) -> CGFloat {
+        image.size.width
     }
 
     func shouldUseInactiveIcon(for title: String) -> Bool {
@@ -618,11 +628,11 @@ private struct MenuBarIconProvider {
     }
 
     func iconOnlyItemLength(for icon: NSImage) -> CGFloat {
-        max(24, icon.size.width + 6)
+        max(18, icon.size.width + Self.leadingPadding + Self.trailingPadding)
     }
 
     private static func loadIcon(named name: String, targetHeight: CGFloat) -> NSImage? {
-        guard let url = Bundle.module.url(forResource: name, withExtension: "svg"),
+        guard let url = resourceURL(named: name, withExtension: "svg"),
               let image = NSImage(contentsOf: url) else {
             return nil
         }
@@ -631,6 +641,35 @@ private struct MenuBarIconProvider {
         image.size = NSSize(width: (targetHeight * aspectRatio).rounded(), height: targetHeight)
         image.isTemplate = true
         return image
+    }
+
+    private static func resourceURL(named name: String, withExtension fileExtension: String) -> URL? {
+        let resourceBundleName = "isLossless_isLossless.bundle"
+        let fileName = "\(name).\(fileExtension)"
+        var candidates: [URL] = []
+
+        if let url = Bundle.main.url(forResource: name, withExtension: fileExtension) {
+            candidates.append(url)
+        }
+
+        if let resourceURL = Bundle.main.resourceURL {
+            let bundleURL = resourceURL.appendingPathComponent(resourceBundleName)
+            if let url = Bundle(url: bundleURL)?.url(forResource: name, withExtension: fileExtension) {
+                candidates.append(url)
+            }
+            candidates.append(bundleURL.appendingPathComponent(fileName))
+        }
+
+        if let executableURL = Bundle.main.executableURL {
+            candidates.append(
+                executableURL
+                    .deletingLastPathComponent()
+                    .appendingPathComponent(resourceBundleName)
+                    .appendingPathComponent(fileName)
+            )
+        }
+
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
     }
 }
 
@@ -920,7 +959,7 @@ struct AppState: Sendable {
         case .playing: "재생 중"
         case .paused: "일시 정지"
         case .stopped: "재생 중이 아님"
-        case .notRunning: "Apple Music이 실행 중이 아닙니다"
+        case .notRunning: "Apple Music 재생 중이 아님"
         case .unknown: "확인 중"
         }
     }
@@ -1525,127 +1564,6 @@ final class AudioOutputObserver {
         )
 
         return status == noErr ? deviceID : nil
-    }
-}
-
-final class MenuActionRowView: NSView {
-    private let target: AnyObject?
-    private let action: Selector
-    private var trackingAreaReference: NSTrackingArea?
-    private var isHovering = false {
-        didSet { needsDisplay = true }
-    }
-    private var isPressing = false {
-        didSet { needsDisplay = true }
-    }
-
-    init(
-        title: String,
-        systemSymbolName: String,
-        shortcut: String,
-        width: CGFloat,
-        height: CGFloat,
-        fontSize: CGFloat,
-        target: AnyObject?,
-        action: Selector
-    ) {
-        self.target = target
-        self.action = action
-        super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
-        translatesAutoresizingMaskIntoConstraints = false
-        widthAnchor.constraint(equalToConstant: width).isActive = true
-        heightAnchor.constraint(equalToConstant: height).isActive = true
-
-        let iconView = NSImageView()
-        iconView.image = NSImage(systemSymbolName: systemSymbolName, accessibilityDescription: title)
-        iconView.image?.isTemplate = true
-        iconView.contentTintColor = .labelColor
-        iconView.imageScaling = .scaleProportionallyDown
-        iconView.translatesAutoresizingMaskIntoConstraints = false
-
-        let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = .systemFont(ofSize: fontSize, weight: .regular)
-        titleLabel.textColor = .labelColor
-        titleLabel.lineBreakMode = .byTruncatingTail
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        let shortcutLabel = NSTextField(labelWithString: shortcut)
-        shortcutLabel.font = .systemFont(ofSize: fontSize, weight: .regular)
-        shortcutLabel.textColor = .secondaryLabelColor
-        shortcutLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        addSubview(iconView)
-        addSubview(titleLabel)
-        addSubview(shortcutLabel)
-
-        NSLayoutConstraint.activate([
-            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 18),
-            iconView.heightAnchor.constraint(equalToConstant: 18),
-
-            titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
-            titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: shortcutLabel.leadingAnchor, constant: -10),
-
-            shortcutLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
-            shortcutLabel.centerYAnchor.constraint(equalTo: centerYAnchor)
-        ])
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func updateTrackingAreas() {
-        if let trackingAreaReference {
-            removeTrackingArea(trackingAreaReference)
-        }
-
-        let area = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self
-        )
-        addTrackingArea(area)
-        trackingAreaReference = area
-        super.updateTrackingAreas()
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        guard isHovering || isPressing else {
-            return
-        }
-
-        let alpha: CGFloat = isPressing ? 0.34 : 0.22
-        NSColor.separatorColor.withAlphaComponent(alpha).setFill()
-        NSBezierPath(roundedRect: bounds.insetBy(dx: -4, dy: 1), xRadius: 7, yRadius: 7).fill()
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        isHovering = true
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isHovering = false
-        isPressing = false
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        isPressing = true
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        isPressing = bounds.contains(convert(event.locationInWindow, from: nil))
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        let shouldPerformAction = isPressing && bounds.contains(convert(event.locationInWindow, from: nil))
-        isPressing = false
-        if shouldPerformAction {
-            NSApp.sendAction(action, to: target, from: self)
-        }
     }
 }
 
