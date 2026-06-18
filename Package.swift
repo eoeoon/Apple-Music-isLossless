@@ -8,12 +8,18 @@ let package = Package(
     ],
     products: [
         .library(name: "IsLosslessCore", targets: ["IsLosslessCore"]),
-        .executable(name: "isLossless", targets: ["isLossless"])
+        .executable(name: "isLossless", targets: ["isLossless"]),
+        .executable(name: "isLosslessDebug", targets: ["isLosslessDebug"])
     ],
     targets: [
         .target(name: "IsLosslessCore"),
         .executableTarget(
             name: "isLossless",
+            dependencies: ["IsLosslessCore"],
+            resources: [.process("Resources")]
+        ),
+        .executableTarget(
+            name: "isLosslessDebug",
             dependencies: ["IsLosslessCore"]
         ),
         .testTarget(

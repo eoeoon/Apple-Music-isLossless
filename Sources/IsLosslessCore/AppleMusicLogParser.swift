@@ -4,6 +4,10 @@ public struct AppleMusicLogParser: Sendable {
     public init() {}
 
     public func parse(_ message: String) -> AudioFormat? {
+        if let playbackFormat = parsePlaybackFormat(message) {
+            return playbackFormat
+        }
+
         guard isSourceFormatMessage(message) else {
             return nil
         }
@@ -13,6 +17,24 @@ public struct AppleMusicLogParser: Sendable {
         let sampleRate = parseSampleRate(in: message)
         let format = AudioFormat(codec: codec, bitDepth: bitDepth, sampleRate: sampleRate)
         return format.isEmpty ? nil : format
+    }
+
+    public func parsePlaybackFormat(_ message: String) -> AudioFormat? {
+        let lowercasedMessage = message.lowercased()
+
+        guard lowercasedMessage.contains("audio format changed to pbaudioformat.") else {
+            return nil
+        }
+
+        if lowercasedMessage.contains("lossless") {
+            return AudioFormat(codec: "ALAC")
+        }
+
+        if lowercasedMessage.contains("pbaudioformat.other") {
+            return AudioFormat(codec: "AAC")
+        }
+
+        return nil
     }
 
     private func parseCodec(in message: String) -> String? {
