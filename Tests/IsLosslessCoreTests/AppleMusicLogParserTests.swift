@@ -64,4 +64,18 @@ struct AppleMusicLogParserTests {
         #expect(format?.bitDepth == 24)
         #expect(format?.sampleRate == 48_000)
     }
+
+    @Test func parsesCurrentPlaybackLosslessState() {
+        let message = "Audio format changed to PBAudioFormat.lossless."
+        let format = parser.parsePlaybackFormat(message)
+
+        #expect(format?.codec == "ALAC")
+    }
+
+    @Test func parsesCurrentPlaybackOtherState() {
+        let message = "Audio format changed to PBAudioFormat.other."
+        let format = parser.parsePlaybackFormat(message)
+
+        #expect(format?.codec == "AAC")
+    }
 }
