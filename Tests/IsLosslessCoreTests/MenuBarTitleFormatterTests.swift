@@ -23,6 +23,15 @@ struct MenuBarTitleFormatterTests {
         #expect(title == "AAC 256kbps")
     }
 
+    @Test func formatsAACWithSampleRateWhenBitRateIsMissing() {
+        let title = formatter.title(
+            for: AudioFormat(codec: "AAC", sampleRate: 44_100),
+            status: .detected
+        )
+
+        #expect(title == "AAC 44.1kHz")
+    }
+
     @Test func formatsALACWithBitDepthAndSampleRate() {
         let title = formatter.title(
             for: AudioFormat(codec: "ALAC", bitDepth: 24, sampleRate: 48_000),
@@ -43,6 +52,15 @@ struct MenuBarTitleFormatterTests {
         )
 
         #expect(title == "isLossless")
+    }
+
+    @Test func usesInactiveTitleForUnverifiedLossless() {
+        let title = formatter.title(
+            for: nil,
+            status: .unverifiedLossless
+        )
+
+        #expect(title == "—")
     }
 
     @Test func preservesFormatWhenPaused() {

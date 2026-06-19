@@ -1,9 +1,9 @@
 #if os(macOS)
 import AppKit
+import AudioToolbox
 import CoreAudio
 import Foundation
 import IsLosslessCore
-import OSLog
 import QuartzCore
 
 let app = NSApplication.shared
@@ -27,8 +27,7 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var synchronizedSlidingGroups: [String: SynchronizedSlidingGroup] = [:]
     private var menuImageViews: [String: NSImageView] = [:]
     private var isMenuOpen = false
-    private var previousTrackIdentity: String?
-    private var followUpRefreshWorkItems: [DispatchWorkItem] = []
+    private var pendingCacheRefreshWorkItem: DispatchWorkItem?
     private let outputObserver = AudioOutputObserver()
 
     private enum MenuLayout {
@@ -44,6 +43,8 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         static let headerFontSize: CGFloat = 14
         static let bodyFontSize: CGFloat = 13
         static let analysisIconTextGap: CGFloat = 6
+        static let formatOutputArrowWidth: CGFloat = 14
+        static let formatOutputArrowInset: CGFloat = 20
 
         static var contentWidth: CGFloat {
             width - horizontalInset * 2
@@ -55,6 +56,10 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         static var analysisSingleColumnWidth: CGFloat {
             contentWidth
+        }
+
+        static var formatOutputFormatColumnWidth: CGFloat {
+            max(0, analysisColumnWidth - formatOutputArrowInset)
         }
 
         static var slidingDetailTextWidth: CGFloat {
@@ -81,6 +86,10 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        monitor.preloadCacheDidChange = { [weak self] in
+            self?.refresh(forceLogScan: false)
+        }
+        monitor.startLogStream()
         configureMenu()
         updateMenuBarTitle()
         observeAppleMusicChanges()
@@ -91,6 +100,8 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         DistributedNotificationCenter.default().removeObserver(self)
+        pendingCacheRefreshWorkItem?.cancel()
+        monitor.stopLogStream()
         outputObserver.stop()
     }
 
@@ -99,22 +110,17 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func manualRefresh() {
-        applyState(monitor.prepareManualRefresh())
-        DispatchQueue.main.async { [weak self] in
-            self?.refresh(forceLogScan: true)
-        }
+        refresh(forceLogScan: true)
     }
 
     private func refresh(forceLogScan: Bool) {
         applyState(monitor.snapshot(forceLogScan: forceLogScan))
-        if !forceLogScan {
-            scheduleFollowUpRefreshesIfNeeded()
-        }
     }
 
     private func applyState(_ newState: AppState) {
         let oldLayoutIdentity = state.menuLayoutIdentity
         state = newState
+        scheduleCacheRefreshIfNeeded(after: newState.refreshAfter)
         updateMenuBarTitle()
         if isMenuOpen {
             if oldLayoutIdentity == state.menuLayoutIdentity {
@@ -125,6 +131,23 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             populateMenu(menu)
         }
+    }
+
+    private func scheduleCacheRefreshIfNeeded(after delay: TimeInterval?) {
+        pendingCacheRefreshWorkItem?.cancel()
+        pendingCacheRefreshWorkItem = nil
+
+        guard let delay else {
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.refresh(forceLogScan: false)
+            }
+        }
+        pendingCacheRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, delay), execute: workItem)
     }
 
     private func observeAppleMusicChanges() {
@@ -155,8 +178,8 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func audioOutputDidChange() {
         let output = monitor.currentOutput()
         var newState = state
-        newState.outputDeviceName = output.name
         newState.outputSampleRate = output.sampleRate
+        newState.outputBitDepth = output.bitDepth
         applyState(newState)
     }
 
@@ -166,7 +189,24 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        if let icon = iconProvider.icon(for: state.format),
+        if state.status == .unverifiedLossless,
+           let icon = iconProvider.inactiveIcon {
+            button.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+            let statusImage: NSImage
+            if let sampleRate = state.unverifiedSampleRate {
+                let title = iconProvider.titleBeforeIcon(for: formatter.formatSampleRate(sampleRate))
+                statusImage = iconProvider.statusImage(for: icon, title: title, font: button.font ?? .systemFont(ofSize: NSFont.systemFontSize))
+            } else {
+                statusImage = iconProvider.iconOnlyStatusImage(for: icon)
+            }
+            statusItem.length = iconProvider.itemLength(for: statusImage)
+            button.title = ""
+            button.image = statusImage
+            button.imagePosition = .imageOnly
+            button.imageHugsTitle = true
+            button.imageScaling = .scaleNone
+            button.contentTintColor = nil
+        } else if let icon = iconProvider.icon(for: state.format),
            let detail = iconProvider.detailText(for: state.format, formatter: formatter) {
             button.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .regular)
             let title = iconProvider.titleBeforeIcon(for: detail)
@@ -181,12 +221,13 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             let title = formatter.title(for: state.format, status: state.status)
             if iconProvider.shouldUseInactiveIcon(for: title), let icon = iconProvider.inactiveIcon {
-                statusItem.length = iconProvider.iconOnlyItemLength(for: icon)
+                let statusImage = iconProvider.iconOnlyStatusImage(for: icon)
+                statusItem.length = iconProvider.itemLength(for: statusImage)
                 button.title = ""
-                button.image = icon
+                button.image = statusImage
                 button.imagePosition = .imageOnly
                 button.imageHugsTitle = true
-                button.imageScaling = .scaleProportionallyDown
+                button.imageScaling = .scaleNone
                 button.contentTintColor = nil
             } else {
                 statusItem.length = NSStatusItem.variableLength
@@ -208,9 +249,7 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        state = monitor.snapshot(forceLogScan: false)
-        updateMenuBarTitle()
-        populateMenu(menu)
+        applyState(monitor.snapshot(forceLogScan: false))
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -237,8 +276,7 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
-        menu.addItem(informationalItem("출력", key: "output-title", secondary: true, compact: true))
-        menu.addItem(informationalItem(outputText, key: "output", emphasized: false, compact: true))
+        menu.addItem(formatOutputItem())
 
         menu.addItem(.separator())
         let refreshItem = NSMenuItem(title: "새로 고침", action: #selector(manualRefresh), keyEquivalent: "r")
@@ -259,7 +297,8 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menuSlidingTextViews["track-artist"]?.stringValue = artistText
         synchronizedSlidingGroups["track-metadata"]?.restart()
         menuImageViews["analysis-detail-icon"]?.image = analysisDetailIcon
-        menuLabels["output"]?.stringValue = outputText
+        menuLabels["format-detail"]?.stringValue = formatText
+        menuLabels["output-detail"]?.stringValue = outputText
     }
 
     private func quitMenuItem() -> NSMenuItem {
@@ -369,6 +408,90 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
+    private func formatOutputItem() -> NSMenuItem {
+        let item = NSMenuItem()
+
+        let formatColumn = twoLineInfoColumn(
+            title: "포맷",
+            detail: formatText,
+            titleKey: "format-title",
+            detailKey: "format-detail",
+            width: MenuLayout.formatOutputFormatColumnWidth
+        )
+        let outputColumn = twoLineInfoColumn(
+            title: "출력",
+            detail: outputText,
+            titleKey: "output-title",
+            detailKey: "output-detail",
+            width: MenuLayout.analysisColumnWidth
+        )
+        let arrowView = formatOutputArrowView()
+
+        let contentView = NSView()
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(formatColumn)
+        contentView.addSubview(outputColumn)
+        contentView.addSubview(arrowView)
+        formatColumn.translatesAutoresizingMaskIntoConstraints = false
+        outputColumn.translatesAutoresizingMaskIntoConstraints = false
+        arrowView.translatesAutoresizingMaskIntoConstraints = false
+
+        NSLayoutConstraint.activate([
+            contentView.widthAnchor.constraint(equalToConstant: MenuLayout.contentWidth),
+            contentView.heightAnchor.constraint(equalToConstant: MenuLayout.analysisContentHeight),
+            formatColumn.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            formatColumn.topAnchor.constraint(equalTo: contentView.topAnchor),
+            outputColumn.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: MenuLayout.analysisColumnWidth + MenuLayout.columnSpacing),
+            outputColumn.topAnchor.constraint(equalTo: contentView.topAnchor),
+            arrowView.leadingAnchor.constraint(equalTo: formatColumn.trailingAnchor, constant: 8),
+            arrowView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor)
+        ])
+
+        item.view = menuItemView(arrangedSubviews: [contentView], fixedContentHeight: MenuLayout.analysisContentHeight)
+        return item
+    }
+
+    private func twoLineInfoColumn(title: String, detail: String, titleKey: String, detailKey: String, width: CGFloat) -> NSView {
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: MenuLayout.bodyFontSize, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
+        menuLabels[titleKey] = titleLabel
+
+        let detailLabel = NSTextField(labelWithString: detail)
+        detailLabel.font = .systemFont(ofSize: MenuLayout.bodyFontSize, weight: .regular)
+        detailLabel.textColor = .labelColor
+        detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.maximumNumberOfLines = 1
+        menuLabels[detailKey] = detailLabel
+
+        let column = NSStackView(views: [
+            fixedHeightRow(containing: titleLabel, width: width),
+            fixedHeightRow(containing: detailLabel, width: width)
+        ])
+        column.orientation = .vertical
+        column.alignment = .leading
+        column.spacing = MenuLayout.lineSpacing
+        column.translatesAutoresizingMaskIntoConstraints = false
+        column.widthAnchor.constraint(equalToConstant: width).isActive = true
+        return column
+    }
+
+    private func formatOutputArrowView() -> NSView {
+        let imageView = NSImageView()
+        imageView.image = NSImage(systemSymbolName: "arrow.right", accessibilityDescription: "포맷에서 출력")
+        imageView.image?.isTemplate = true
+        imageView.contentTintColor = .secondaryLabelColor
+        imageView.imageScaling = .scaleProportionallyDown
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            imageView.widthAnchor.constraint(equalToConstant: MenuLayout.formatOutputArrowWidth),
+            imageView.heightAnchor.constraint(equalToConstant: MenuLayout.analysisDetailRowHeight)
+        ])
+        return imageView
+    }
+
     private func fixedHeightRow(containing view: NSView, width: CGFloat) -> NSView {
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -442,53 +565,49 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return container
     }
 
-    private func scheduleFollowUpRefreshesIfNeeded() {
-        guard state.playbackStatus == .playing else {
-            return
-        }
-
-        guard state.trackIdentity != previousTrackIdentity else {
-            return
-        }
-
-        previousTrackIdentity = state.trackIdentity
-        followUpRefreshWorkItems.forEach { $0.cancel() }
-        followUpRefreshWorkItems.removeAll()
-
-        for delay in [1.0, 3.0] {
-            let workItem = DispatchWorkItem { [weak self] in
-                Task { @MainActor in
-                    self?.refresh(forceLogScan: false)
-                }
-            }
-            followUpRefreshWorkItems.append(workItem)
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
-        }
-    }
-
     private var analysisStatusText: String {
         state.statusText
     }
 
-    private var outputText: String {
-        let sampleRateText: String?
-        if state.format?.codec == "ALAC",
-           let sourceSampleRate = state.format?.sampleRate,
-           let outputSampleRate = state.outputSampleRate {
-            sampleRateText = "\(formatter.formatSampleRate(sourceSampleRate)) → \(formatter.formatSampleRate(outputSampleRate))"
-        } else {
-            sampleRateText = state.outputSampleRate.map(formatter.formatSampleRate)
+    private var formatText: String {
+        guard hasCurrentTrack,
+              state.status == .detected,
+              let format = state.format else {
+            return "—"
         }
 
-        let text = [state.outputDeviceName, sampleRateText]
+        if format.codec == "ALAC" {
+            let bitDepthText = format.bitDepth.map { "\($0)비트" }
+            let sampleRateText = format.sampleRate.map(formatter.formatSampleRate)
+            let text = [bitDepthText, sampleRateText]
+                .compactMap { $0 }
+                .joined(separator: " ")
+            return text.isEmpty ? "—" : text
+        }
+
+        return format.bitRate.map { "\($0)kbps" } ?? "—"
+    }
+
+    private var outputText: String {
+        let bitDepthText = state.outputBitDepth.map { "\($0)비트" }
+        let sampleRateText = state.outputSampleRate.map(formatter.formatSampleRate)
+        let text = [bitDepthText, sampleRateText]
             .compactMap { $0 }
-            .joined(separator: " · ")
+            .joined(separator: " ")
         return text.isEmpty ? "—" : text
     }
 
     private var analysisDetailText: String {
         guard hasCurrentTrack else {
             return "—"
+        }
+
+        if state.status == .unverifiedLossless {
+            return "확인되지 않은 무손실"
+        }
+
+        if state.status == .failed {
+            return "확인 실패"
         }
 
         guard state.status != .detecting else {
@@ -514,7 +633,7 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return icon
         }
 
-        if state.status != .detecting {
+        if state.status != .detecting && state.status != .failed && state.status != .unverifiedLossless {
             return iconProvider.inactiveOtherMenuIcon ?? NSImage(size: NSSize(width: 20, height: 11))
         }
 
@@ -578,7 +697,15 @@ private struct MenuBarIconProvider {
         case "ALAC":
             return format?.sampleRate.map(formatter.formatSampleRate)
         case "AAC":
-            return format?.bitRate.map { "\($0)kbps" }
+            if let bitRate = format?.bitRate {
+                return "\(bitRate)kbps"
+            }
+
+            if let sampleRate = format?.sampleRate {
+                return formatter.formatSampleRate(sampleRate)
+            }
+
+            return "AAC"
         default:
             return nil
         }
@@ -589,6 +716,19 @@ private struct MenuBarIconProvider {
     }
 
     func statusImage(for icon: NSImage, title: String, font: NSFont) -> NSImage {
+        statusImage(for: icon, title: title, font: font, minimumWidth: 0)
+    }
+
+    func iconOnlyStatusImage(for icon: NSImage) -> NSImage {
+        statusImage(
+            for: icon,
+            title: "",
+            font: .systemFont(ofSize: NSFont.systemFontSize, weight: .regular),
+            minimumWidth: max(18, icon.size.width + Self.leadingPadding + Self.trailingPadding)
+        )
+    }
+
+    private func statusImage(for icon: NSImage, title: String, font: NSFont, minimumWidth: CGFloat) -> NSImage {
         let text = title as NSString
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font,
@@ -596,7 +736,8 @@ private struct MenuBarIconProvider {
         ]
         let textSize = text.size(withAttributes: attributes)
         let textWidth = ceil(textSize.width)
-        let imageWidth = ceil(Self.leadingPadding + textWidth + icon.size.width + Self.trailingPadding)
+        let contentWidth = ceil(Self.leadingPadding + textWidth + icon.size.width + Self.trailingPadding)
+        let imageWidth = max(contentWidth, ceil(minimumWidth))
         let imageSize = NSSize(width: imageWidth, height: Self.statusImageHeight)
         let image = NSImage(size: imageSize)
 
@@ -605,11 +746,14 @@ private struct MenuBarIconProvider {
         NSRect(origin: .zero, size: imageSize).fill()
 
         let textY = ((Self.statusImageHeight - textSize.height) / 2).rounded(.down)
-        text.draw(at: NSPoint(x: Self.leadingPadding, y: textY), withAttributes: attributes)
+        if textWidth > 0 {
+            text.draw(at: NSPoint(x: Self.leadingPadding, y: textY), withAttributes: attributes)
+        }
 
         let iconY = ((Self.statusImageHeight - icon.size.height) / 2).rounded(.down) + Self.iconVerticalOffset
+        let iconX = imageWidth - Self.trailingPadding - icon.size.width
         icon.draw(
-            in: NSRect(x: Self.leadingPadding + textWidth, y: iconY, width: icon.size.width, height: icon.size.height),
+            in: NSRect(x: iconX, y: iconY, width: icon.size.width, height: icon.size.height),
             from: NSRect(origin: .zero, size: icon.size),
             operation: .sourceOver,
             fraction: 1
@@ -625,10 +769,6 @@ private struct MenuBarIconProvider {
 
     func shouldUseInactiveIcon(for title: String) -> Bool {
         title == "—" || title == "isLossless"
-    }
-
-    func iconOnlyItemLength(for icon: NSImage) -> CGFloat {
-        max(18, icon.size.width + Self.leadingPadding + Self.trailingPadding)
     }
 
     private static func loadIcon(named name: String, targetHeight: CGFloat) -> NSImage? {
@@ -947,15 +1087,17 @@ struct AppState: Sendable {
     var trackTitle: String?
     var artistName: String?
     var albumName: String?
-    var outputDeviceName: String?
     var outputSampleRate: Double?
+    var outputBitDepth: Int?
+    var refreshAfter: TimeInterval?
+    var unverifiedSampleRate: Double?
 
     var menuLayoutIdentity: String {
         trackTitle != nil || artistName != nil || albumName != nil ? "analysis-two-column" : "analysis-single-column"
     }
 
     var statusText: String {
-        switch playbackStatus {
+        return switch playbackStatus {
         case .playing: "재생 중"
         case .paused: "일시 정지"
         case .stopped: "재생 중이 아님"
@@ -969,6 +1111,10 @@ struct AppState: Sendable {
         case .detected:
             let title = MenuBarTitleFormatter().title(for: format, status: status)
             return "현재 Apple Music 포맷: \(title)"
+        case .unverifiedLossless:
+            return "현재 Apple Music 포맷: 확인되지 않은 무손실"
+        case .failed:
+            return "현재 Apple Music 포맷 확인 실패"
         default:
             return statusText
         }
@@ -983,143 +1129,134 @@ enum PlaybackStatus: Sendable {
     case playing
 }
 
+@MainActor
 final class AppleMusicMonitor {
     private let parser = AppleMusicLogParser()
     private let outputReader = AudioOutputReader()
+    private let localAudioFormatReader = LocalAudioFormatReader()
+    private lazy var logStream = AppleMusicLogStream { [weak self] entries in
+        Task { @MainActor in
+            self?.rememberPreloadLogEntries(entries)
+        }
+    }
+    private var preloadAssembler = AppleMusicPreloadAssembler()
+    private var preloadCache = AppleMusicPreloadCache()
+    private var preloadCacheRevision = 0
+    private var lastResolvedPreloadCacheRevision = -1
     private var cachedFormat: AudioFormat?
     private var currentTrackIdentity: String?
-    private var currentTrackStartedAt: Date?
-    private var pendingLogScanAttempts = 0
-    private var nextLogScanAt: Date?
+    private var currentTrackDetectionStartedAt: Date?
+    private var currentTrackAppleScriptSampleRate: Double?
+    private var cachedStatus: DetectionStatus?
+    private var cachedFormatSource: FormatSource?
+    private var cachedUnverifiedSampleRate: Double?
+    private let initialCacheLookupDelay: TimeInterval = 0.5
+    private let cacheLookupWaitLimit: TimeInterval = 3
+    private let playbackLosslessPromotionWindow: TimeInterval = 1
+    private let playbackLosslessPromotionDeliveryTolerance: TimeInterval = 0.25
+    private let emptyCacheRetryInterval: TimeInterval = 0.5
+    private var firstCacheLookupAt: Date?
+    private var cacheLookupDeadline: Date?
+    private var nextCacheRefreshAt: Date?
+    var preloadCacheDidChange: (() -> Void)?
+
+    private enum FormatSource {
+        case localFile
+        case preloadCache
+        case playbackLog
+        case fallback
+    }
+
+    func startLogStream() {
+        logStream.start()
+    }
+
+    func stopLogStream() {
+        logStream.stop()
+    }
 
     func currentOutput() -> AudioOutputSnapshot {
         outputReader.currentOutput()
     }
 
-    func prepareManualRefresh() -> AppState {
-        guard isAppleMusicRunning else {
-            resetPlaybackTracking()
-            return AppState(status: .appleMusicNotRunning, playbackStatus: .notRunning)
-        }
-
-        let track = currentTrack()
-        cachedFormat = nil
-        stopLogScanPlan()
-
-        if track.isStopped {
-            resetPlaybackTracking()
-        } else {
-            currentTrackIdentity = track.identity
-            currentTrackStartedAt = track.startedAt ?? Date().addingTimeInterval(-8)
-        }
-
-        return makeState(for: track, format: nil)
-    }
-
     func snapshot(forceLogScan: Bool = false) -> AppState {
+        let now = Date()
         guard isAppleMusicRunning else {
             resetPlaybackTracking()
             return AppState(status: .appleMusicNotRunning, playbackStatus: .notRunning)
         }
 
         let track = currentTrack()
+        if !track.isStopped,
+           track.identity == currentTrackIdentity {
+            currentTrackAppleScriptSampleRate = track.sampleRate ?? currentTrackAppleScriptSampleRate
+        }
+
         if track.isStopped {
             resetPlaybackTracking()
         } else if track.identity != currentTrackIdentity {
-            cachedFormat = nil
-            currentTrackIdentity = track.identity
-            currentTrackStartedAt = track.startedAt ?? Date().addingTimeInterval(-8)
-            startAutomaticLogScanPlan()
+            beginDetection(for: track, now: now)
+        } else if forceLogScan, !track.isStopped {
+            debugLog("manual refresh requested: target title=\(Self.debugQuote(track.title)) durationInt=\(Self.debugDurationInt(track.duration))")
+            beginDetection(for: track, now: now)
+        } else if cachedStatus == .detecting {
+            advanceCacheLookupIfNeeded(for: track, now: now)
+        } else if cachedStatus == .unverifiedLossless {
+            rememberUnverifiedSampleRate(from: track)
+        } else if cachedFormatSource == .playbackLog,
+                  preloadCacheRevision != lastResolvedPreloadCacheRevision {
+            refinePlaybackLogFormatFromPreloadCache(for: track)
         } else if cachedFormat != nil {
             cachedFormat = cachedFormat?.preservingBitDepth(from: track.format) ?? track.format
         }
 
-        if forceLogScan, !track.isStopped {
-            cachedFormat = nil
-            currentTrackStartedAt = track.startedAt ?? Date().addingTimeInterval(-8)
-            startManualLogScanAttempt()
-        }
-
-        if let isFinalLogScanAttempt = consumeDueLogScanAttempt() {
-            if let latestFormat = latestFormatFromLogs(since: currentTrackStartedAt) {
-                let resolvedFormat = track.format?.merging(latestFormat) ?? latestFormat
-                if resolvedFormat.isReadyForDisplay {
-                    cachedFormat = resolvedFormat
-                }
-                stopLogScanPlan()
-            } else if isFinalLogScanAttempt {
-                cachedFormat = fallbackAACFormat(from: track)
-            }
-        }
-
-        return makeState(for: track, format: cachedFormat)
+        return makeState(for: track, format: cachedFormat, status: cachedStatus, now: now)
     }
 
     private func resetPlaybackTracking() {
         cachedFormat = nil
+        cachedStatus = nil
+        cachedFormatSource = nil
+        cachedUnverifiedSampleRate = nil
         currentTrackIdentity = nil
-        currentTrackStartedAt = nil
-        stopLogScanPlan()
-    }
-
-    private func startAutomaticLogScanPlan() {
-        pendingLogScanAttempts = 2
-        nextLogScanAt = Date().addingTimeInterval(1)
-    }
-
-    private func startManualLogScanAttempt() {
-        pendingLogScanAttempts = 1
-        nextLogScanAt = Date()
-    }
-
-    private func stopLogScanPlan() {
-        pendingLogScanAttempts = 0
-        nextLogScanAt = nil
-    }
-
-    private func consumeDueLogScanAttempt() -> Bool? {
-        guard pendingLogScanAttempts > 0 else {
-            return nil
-        }
-
-        guard let nextLogScanAt, Date() >= nextLogScanAt else {
-            return nil
-        }
-
-        let isFinalAttempt = pendingLogScanAttempts == 1
-        pendingLogScanAttempts -= 1
-        self.nextLogScanAt = pendingLogScanAttempts > 0 ? Date().addingTimeInterval(2) : nil
-        return isFinalAttempt
+        currentTrackDetectionStartedAt = nil
+        currentTrackAppleScriptSampleRate = nil
+        clearCacheLookupSchedule()
     }
 
     private func fallbackAACFormat(from track: TrackSnapshot) -> AudioFormat? {
-        let format = AudioFormat(
-            codec: "AAC",
-            bitRate: track.bitRate,
-            sampleRate: track.sampleRate
-        )
-        return format.isReadyForDisplay ? format : nil
+        guard let bitRate = track.bitRate,
+              bitRate > 0 else {
+            return nil
+        }
+
+        return AudioFormat(codec: "AAC", bitRate: bitRate, sampleRate: track.sampleRate)
     }
 
-    private func makeState(for track: TrackSnapshot, format: AudioFormat?) -> AppState {
+    private func makeState(for track: TrackSnapshot, format: AudioFormat?, status: DetectionStatus? = nil, now: Date = Date()) -> AppState {
         let output = outputReader.currentOutput()
+        let resolvedStatus = status ?? (format == nil ? .detecting : .detected)
+        let resolvedUnverifiedSampleRate = resolvedStatus == .unverifiedLossless
+            ? cachedUnverifiedSampleRate ?? track.sampleRate
+            : nil
+
         var state = AppState(
-            status: format == nil ? .detecting : .detected,
+            status: resolvedStatus,
             playbackStatus: track.playbackStatus,
             format: format,
             trackIdentity: track.identity,
             trackTitle: track.title,
             artistName: track.artist,
             albumName: track.album,
-            outputDeviceName: output.name,
-            outputSampleRate: output.sampleRate
+            outputSampleRate: output.sampleRate,
+            outputBitDepth: output.bitDepth,
+            refreshAfter: cacheRefreshDelay(now: now),
+            unverifiedSampleRate: resolvedUnverifiedSampleRate
         )
 
         if track.isStopped {
             state.status = .notPlaying
             state.format = nil
-        } else if track.isPaused {
-            state.status = .paused
         }
 
         return state
@@ -1145,9 +1282,15 @@ final class AppleMusicMonitor {
             set trackKind to ""
             set trackBitRate to ""
             set trackSampleRate to ""
+            set trackDuration to ""
             set trackPosition to ""
+            set trackLocation to ""
+            set trackDatabaseID to ""
             try
                 set trackID to persistent ID of currentTrack as text
+            end try
+            try
+                set trackDatabaseID to database ID of currentTrack as text
             end try
             try
                 set trackName to name of currentTrack as text
@@ -1168,9 +1311,36 @@ final class AppleMusicMonitor {
                 set trackSampleRate to sample rate of currentTrack as text
             end try
             try
+                set trackDuration to duration of currentTrack as text
+            end try
+            try
                 set trackPosition to player position as text
             end try
-            return playerState & fieldDelimiter & trackID & fieldDelimiter & trackName & fieldDelimiter & artistName & fieldDelimiter & albumName & fieldDelimiter & trackKind & fieldDelimiter & trackBitRate & fieldDelimiter & trackSampleRate & fieldDelimiter & trackPosition
+            try
+                set currentLocation to location of currentTrack
+                if currentLocation is not missing value then
+                    set trackLocation to POSIX path of (currentLocation as alias)
+                end if
+            end try
+            if trackLocation is "" then
+                try
+                    set libraryTrack to first file track of library playlist 1 whose persistent ID is trackID
+                    set libraryLocation to location of libraryTrack
+                    if libraryLocation is not missing value then
+                        set trackLocation to POSIX path of (libraryLocation as alias)
+                    end if
+                end try
+            end if
+            if trackLocation is "" then
+                try
+                    set libraryTrack to first file track of library playlist 1 whose database ID is (trackDatabaseID as integer)
+                    set libraryLocation to location of libraryTrack
+                    if libraryLocation is not missing value then
+                        set trackLocation to POSIX path of (libraryLocation as alias)
+                    end if
+                end try
+            end if
+            return playerState & fieldDelimiter & trackID & fieldDelimiter & trackName & fieldDelimiter & artistName & fieldDelimiter & albumName & fieldDelimiter & trackKind & fieldDelimiter & trackBitRate & fieldDelimiter & trackSampleRate & fieldDelimiter & trackDuration & fieldDelimiter & trackPosition & fieldDelimiter & trackLocation
         end tell
         """
 
@@ -1193,40 +1363,306 @@ final class AppleMusicMonitor {
             album: parts.nonEmptyValue(at: 4),
             kind: parts.nonEmptyValue(at: 5),
             bitRate: parts.nonEmptyValue(at: 6).flatMap(Int.init),
-            sampleRate: parts.nonEmptyValue(at: 7).flatMap(Double.init),
-            playerPosition: parts.nonEmptyValue(at: 8).flatMap(Double.init)
+            sampleRate: Self.parseAppleScriptSampleRate(parts.nonEmptyValue(at: 7)),
+            duration: parts.nonEmptyValue(at: 8).flatMap(Double.init),
+            playerPosition: parts.nonEmptyValue(at: 9).flatMap(Double.init),
+            localFilePath: parts.nonEmptyValue(at: 10)
         )
     }
 
-    private func latestFormatFromLogs(since date: Date?) -> AudioFormat? {
-        let store: OSLogStore
-        do {
-            store = try OSLogStore.local()
-        } catch {
+    private static func parseAppleScriptSampleRate(_ value: String?) -> Double? {
+        guard let value else {
             return nil
         }
 
-        let position = store.position(date: (date ?? Date().addingTimeInterval(-12)).addingTimeInterval(-1))
-        let predicate = NSPredicate(
-            format: "process == %@ AND eventMessage CONTAINS[c] %@",
-            "Music",
-            "Audio format changed to PBAudioFormat."
-        )
-        guard let entries = try? store.getEntries(at: position, matching: predicate) else {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
             return nil
         }
 
-        let logEntries = entries
-            .compactMap { $0 as? OSLogEntryLog }
-            .reversed()
+        if let direct = Double(trimmed) {
+            return normalizeSampleRate(direct)
+        }
 
-        for entry in logEntries {
-            if let format = parser.parsePlaybackFormat(entry.composedMessage) {
-                return format
-            }
+        let compact = trimmed.replacingOccurrences(of: " ", with: "")
+        let commaGroups = compact.split(separator: ",", omittingEmptySubsequences: false)
+        if commaGroups.count > 1,
+           commaGroups.dropFirst().allSatisfy({ $0.count == 3 }),
+           let grouped = Double(commaGroups.joined()) {
+            return normalizeSampleRate(grouped)
+        }
+
+        if let decimalComma = Double(compact.replacingOccurrences(of: ",", with: ".")) {
+            return normalizeSampleRate(decimalComma)
         }
 
         return nil
+    }
+
+    private static func normalizeSampleRate(_ sampleRate: Double) -> Double {
+        sampleRate > 0 && sampleRate < 1_000 ? sampleRate * 1_000 : sampleRate
+    }
+
+    private func beginDetection(for track: TrackSnapshot, now: Date) {
+        currentTrackIdentity = track.identity
+        currentTrackDetectionStartedAt = now
+        currentTrackAppleScriptSampleRate = track.sampleRate
+        cachedUnverifiedSampleRate = nil
+        cachedFormatSource = nil
+
+        if let localFileURL = track.localFileURL {
+            switch localAudioFormatReader.format(for: localFileURL) {
+            case .success(let localFormat):
+                let resolvedFormat = localFormat.fillingMissingFields(from: track.format)
+                cachedFormat = resolvedFormat
+                cachedStatus = .detected
+                cachedFormatSource = .localFile
+                clearCacheLookupSchedule()
+                debugLog("format: local file detected path=\(Self.debugQuote(localFileURL.path)) \(debugFormat(resolvedFormat))")
+                return
+
+            case .failure(let error):
+                debugLog("format: local file probe failed path=\(Self.debugQuote(localFileURL.path)) error=\(error.localizedDescription); falling back to preload cache")
+            }
+        } else if track.kindSuggestsDownloadedAppleMusicFile {
+            debugLog("format: local file location unavailable kind=\(Self.debugQuote(track.kind)) title=\(Self.debugQuote(track.title)); falling back to preload cache")
+        }
+
+        beginCacheLookup(for: track, now: now)
+    }
+
+    private func beginCacheLookup(for track: TrackSnapshot, now: Date) {
+        cachedFormat = nil
+        cachedStatus = .detecting
+        cachedFormatSource = nil
+        cachedUnverifiedSampleRate = nil
+        currentTrackIdentity = track.identity
+        currentTrackAppleScriptSampleRate = track.sampleRate ?? currentTrackAppleScriptSampleRate
+        firstCacheLookupAt = now.addingTimeInterval(initialCacheLookupDelay)
+        cacheLookupDeadline = now.addingTimeInterval(cacheLookupWaitLimit)
+        nextCacheRefreshAt = firstCacheLookupAt
+        debugLog("cache lookup scheduled: initialDelay=\(initialCacheLookupDelay)s deadline=\(debugTime(cacheLookupDeadline)) target title=\(Self.debugQuote(track.title)) durationInt=\(Self.debugDurationInt(track.duration))")
+    }
+
+    private func advanceCacheLookupIfNeeded(for track: TrackSnapshot, now: Date) {
+        if let firstCacheLookupAt, now < firstCacheLookupAt {
+            nextCacheRefreshAt = firstCacheLookupAt
+            return
+        }
+
+        if let nextCacheRefreshAt,
+           now < nextCacheRefreshAt,
+           preloadCacheRevision == lastResolvedPreloadCacheRevision {
+            return
+        }
+
+        resolveFormatFromPreloadCache(for: track, now: now)
+    }
+
+    private func resolveFormatFromPreloadCache(for track: TrackSnapshot, now: Date) {
+        lastResolvedPreloadCacheRevision = preloadCacheRevision
+        debugLog("cache lookup: target title=\(Self.debugQuote(track.title)) durationInt=\(Self.debugDurationInt(track.duration)) kind=\(Self.debugQuote(track.kind)) cached=\(preloadCache.count)")
+
+        switch preloadCache.lookup(title: track.title, duration: track.duration) {
+        case .found(let record):
+            let resolvedFormat = track.format?.merging(record.format) ?? record.format
+            if resolvedFormat.isReadyForDisplay {
+                cachedFormat = resolvedFormat
+                cachedStatus = .detected
+                cachedFormatSource = .preloadCache
+                cachedUnverifiedSampleRate = nil
+                clearCacheLookupSchedule()
+                debugLog("format: found queueItemID=\(record.queueItemID) group=\(record.groupID) \(debugFormat(resolvedFormat))")
+            } else {
+                resolveNonAlacFallback(from: track)
+                clearCacheLookupSchedule()
+                debugLog("format: completed preload format not display-ready queueItemID=\(record.queueItemID) group=\(record.groupID); fallback \(debugFormat(cachedFormat)) status=\(cachedStatusDescription)")
+            }
+
+        case .fallbackAAC:
+            handlePreloadCacheMiss(for: track, now: now, reason: "no-exact-match")
+
+        case .failed:
+            handlePreloadCacheMiss(for: track, now: now, reason: "cache-empty")
+        }
+    }
+
+    private func resolveNonAlacFallback(from track: TrackSnapshot) {
+        if let aacFormat = fallbackAACFormat(from: track) {
+            cachedFormat = aacFormat
+            cachedStatus = .detected
+            cachedFormatSource = .fallback
+            cachedUnverifiedSampleRate = nil
+        } else {
+            cachedFormat = nil
+            cachedStatus = .unverifiedLossless
+            cachedFormatSource = .fallback
+            rememberUnverifiedSampleRate(from: track)
+        }
+    }
+
+    private func rememberUnverifiedSampleRate(from track: TrackSnapshot) {
+        cachedUnverifiedSampleRate = track.sampleRate ?? cachedUnverifiedSampleRate
+    }
+
+    private func handlePreloadCacheMiss(for track: TrackSnapshot, now: Date, reason: String) {
+        guard let cacheLookupDeadline, now < cacheLookupDeadline else {
+            if reason == "cache-empty" {
+                cachedFormat = nil
+                cachedStatus = .failed
+                cachedFormatSource = nil
+                cachedUnverifiedSampleRate = nil
+                clearCacheLookupSchedule()
+                debugLog("format: preload cache empty after wait; failed without AAC fallback")
+                return
+            }
+
+            if reason == "no-exact-match" {
+                debugPreloadCacheLookupFailure(
+                    candidates: preloadCache.records,
+                    title: track.title,
+                    duration: track.duration
+                )
+            }
+            resolveNonAlacFallback(from: track)
+            clearCacheLookupSchedule()
+            debugLog("format: preload cache miss after wait reason=\(reason); fallback \(debugFormat(cachedFormat)) status=\(cachedStatusDescription)")
+            return
+        }
+
+        cachedFormat = nil
+        cachedStatus = .detecting
+        cachedFormatSource = nil
+        cachedUnverifiedSampleRate = nil
+        nextCacheRefreshAt = min(now.addingTimeInterval(emptyCacheRetryInterval), cacheLookupDeadline)
+        debugLog("format: preload cache miss reason=\(reason); waiting for cache until \(debugTime(cacheLookupDeadline))")
+    }
+
+    private func clearCacheLookupSchedule() {
+        firstCacheLookupAt = nil
+        cacheLookupDeadline = nil
+        nextCacheRefreshAt = nil
+    }
+
+    private func cacheRefreshDelay(now: Date) -> TimeInterval? {
+        guard cachedStatus == .detecting,
+              let nextCacheRefreshAt else {
+            return nil
+        }
+
+        return max(0, nextCacheRefreshAt.timeIntervalSince(now))
+    }
+
+    private func rememberPreloadLogEntries(_ entries: [AppleMusicLogStream.Entry]) {
+        var didChangeCache = false
+        var didChangePlaybackFormat = false
+
+        for entry in entries {
+            if parser.parsePlaybackFormat(entry.message)?.codec == "ALAC" {
+                didChangePlaybackFormat = promotePlaybackLosslessIfEligible(from: entry) || didChangePlaybackFormat
+            }
+
+            let completedRecords = preloadAssembler.ingest(
+                message: entry.message,
+                date: entry.date,
+                parser: parser
+            )
+
+            for record in completedRecords {
+                didChangeCache = rememberCompletedPreloadRecord(record) || didChangeCache
+            }
+        }
+
+        if didChangeCache || didChangePlaybackFormat {
+            preloadCacheDidChange?()
+        }
+    }
+
+    @discardableResult
+    private func promotePlaybackLosslessIfEligible(from entry: AppleMusicLogStream.Entry) -> Bool {
+        guard let startedAt = currentTrackDetectionStartedAt else {
+            return false
+        }
+
+        guard entry.date >= startedAt else {
+            return false
+        }
+
+        let elapsed = entry.date.timeIntervalSince(startedAt)
+        let allowedElapsed = playbackLosslessPromotionWindow + playbackLosslessPromotionDeliveryTolerance
+        guard elapsed <= allowedElapsed else {
+            debugLog("format: playback lossless ignored outside promotion window elapsed=\(elapsed)s limit=\(allowedElapsed)s")
+            return false
+        }
+
+        if cachedFormatSource == .preloadCache || cachedFormatSource == .localFile || cachedFormat?.bitDepth != nil {
+            debugLog("format: playback lossless ignored: authoritative format already available source=\(Self.debugOptional(cachedFormatSource)) \(debugFormat(cachedFormat))")
+            return false
+        }
+
+        let track = currentTrack()
+        guard !track.isStopped else {
+            return false
+        }
+
+        if let observedIdentity = track.identity,
+           let expectedIdentity = currentTrackIdentity,
+           observedIdentity != expectedIdentity {
+            debugLog("format: playback lossless ignored for stale track expected=\(Self.debugQuote(expectedIdentity)) observed=\(Self.debugQuote(observedIdentity))")
+            return false
+        }
+
+        let sampleRate = track.sampleRate ?? currentTrackAppleScriptSampleRate
+        guard let sampleRate else {
+            debugLog("format: playback lossless ignored: missing AppleScript sampleRate")
+            return false
+        }
+
+        let promotedFormat = AudioFormat(codec: "ALAC", sampleRate: sampleRate)
+        guard cachedFormat != promotedFormat || cachedStatus != .detected || cachedFormatSource != .playbackLog else {
+            return false
+        }
+
+        cachedFormat = promotedFormat
+        cachedStatus = .detected
+        cachedFormatSource = .playbackLog
+        cachedUnverifiedSampleRate = nil
+        currentTrackAppleScriptSampleRate = sampleRate
+        clearCacheLookupSchedule()
+        debugLog("format: playback lossless promoted elapsed=\(elapsed)s window=\(playbackLosslessPromotionWindow)s tolerance=\(playbackLosslessPromotionDeliveryTolerance)s sampleRate=\(sampleRate)")
+        return true
+    }
+
+    private func refinePlaybackLogFormatFromPreloadCache(for track: TrackSnapshot) {
+        lastResolvedPreloadCacheRevision = preloadCacheRevision
+
+        guard case .found(let record) = preloadCache.lookup(title: track.title, duration: track.duration) else {
+            return
+        }
+
+        let baseFormat = cachedFormat ?? AudioFormat(codec: "ALAC", sampleRate: currentTrackAppleScriptSampleRate ?? track.sampleRate)
+        let resolvedFormat = baseFormat.merging(record.format)
+        guard resolvedFormat.isReadyForDisplay else {
+            return
+        }
+
+        cachedFormat = resolvedFormat
+        cachedStatus = .detected
+        cachedFormatSource = .preloadCache
+        cachedUnverifiedSampleRate = nil
+        debugLog("format: playback lossless refined from preload cache queueItemID=\(record.queueItemID) group=\(record.groupID) \(debugFormat(resolvedFormat))")
+    }
+
+    @discardableResult
+    private func rememberCompletedPreloadRecord(_ record: AppleMusicPreloadRecord) -> Bool {
+        let existingRecord = preloadCache.store(record)
+        guard existingRecord != record else {
+            return false
+        }
+
+        preloadCacheRevision += 1
+        debugLog("preload: saved completed format queueItemID=\(record.queueItemID) title=\(Self.debugQuote(record.title)) group=\(record.groupID) parsed=\(debugFormat(record.format))")
+        return true
     }
 
     private struct TrackSnapshot {
@@ -1238,7 +1674,9 @@ final class AppleMusicMonitor {
         var kind: String?
         var bitRate: Int?
         var sampleRate: Double?
+        var duration: Double?
         var playerPosition: Double?
+        var localFilePath: String?
 
         var isStopped: Bool {
             playerState?.lowercased() == "stopped"
@@ -1257,14 +1695,6 @@ final class AppleMusicMonitor {
             }
         }
 
-        var startedAt: Date? {
-            guard let playerPosition else {
-                return nil
-            }
-
-            return Date().addingTimeInterval(-playerPosition - 5)
-        }
-
         var identity: String? {
             guard !isStopped else { return nil }
             return [persistentID, title, artist, album]
@@ -1279,6 +1709,25 @@ final class AppleMusicMonitor {
                 sampleRate: sampleRate
             )
             return format.isEmpty ? nil : format
+        }
+
+        var localFileURL: URL? {
+            guard let localFilePath,
+                  !localFilePath.isEmpty else {
+                return nil
+            }
+
+            return URL(fileURLWithPath: localFilePath)
+        }
+
+        var kindSuggestsDownloadedAppleMusicFile: Bool {
+            guard let kind else {
+                return false
+            }
+
+            let lowercasedKind = kind.lowercased()
+            return lowercasedKind.contains("apple music")
+                && (lowercasedKind.contains("오디오 파일") || lowercasedKind.contains("audio file"))
         }
 
         private var codec: String? {
@@ -1296,6 +1745,285 @@ final class AppleMusicMonitor {
             return nil
         }
     }
+
+    private func integerSeconds(_ value: Double) -> Int {
+        Int(value)
+    }
+
+    private func debugLog(_ message: @autoclosure () -> String) {
+        print("[isLossless] \(message())")
+    }
+
+    private func debugPreloadCacheLookupFailure(
+        candidates: [AppleMusicPreloadRecord],
+        title: String?,
+        duration: Double?
+    ) {
+        guard !candidates.isEmpty else {
+            debugLog("preload lookup failed: completed cache is empty")
+            return
+        }
+
+        let titleMatches = title.map { targetTitle in
+            candidates.filter { titlesMatch($0.title, targetTitle) }
+        } ?? []
+        let durationMatches = duration.map { targetDuration in
+            candidates.filter { durationsMatch($0.duration, targetDuration) }
+        } ?? []
+        let titleOnlyMatches = titleMatches.filter { candidate in
+            duration.map { !durationsMatch(candidate.duration, $0) } ?? true
+        }
+        let durationOnlyMatches = durationMatches.filter { candidate in
+            title.map { !titlesMatch(candidate.title, $0) } ?? true
+        }
+
+        debugLog(
+            "preload lookup: failed reason=no-exact-match completedCandidates=\(candidates.count) targetTitle=\(Self.debugQuote(title)) targetDurationInt=\(Self.debugDurationInt(duration)) titleMatches=\(titleMatches.count) durationMatches=\(durationMatches.count) titleOnly=\(titleOnlyMatches.count) durationOnly=\(durationOnlyMatches.count)"
+        )
+
+        if !titleOnlyMatches.isEmpty {
+            debugLog("preload lookup title-only candidates: \(debugPreloadCandidates(titleOnlyMatches))")
+        }
+
+        if !durationOnlyMatches.isEmpty {
+            debugLog("preload lookup duration-only candidates: \(debugPreloadCandidates(durationOnlyMatches))")
+        }
+
+        if titleOnlyMatches.isEmpty && durationOnlyMatches.isEmpty {
+            debugLog("preload lookup recent candidates: \(debugPreloadCandidates(candidates))")
+        }
+    }
+
+    private func debugPreloadCandidates(_ candidates: [AppleMusicPreloadRecord]) -> String {
+        candidates
+            .prefix(5)
+            .map { "id=\($0.queueItemID) title=\(Self.debugQuote($0.title)) durationInt=\(integerSeconds($0.duration)) group=\($0.groupID) rawDuration=\($0.duration)" }
+            .joined(separator: " | ")
+    }
+
+    private func debugFormat(_ format: AudioFormat?) -> String {
+        guard let format else {
+            return "-"
+        }
+
+        return "codec=\(Self.debugOptional(format.codec)) bitDepth=\(Self.debugOptional(format.bitDepth)) bitRate=\(Self.debugOptional(format.bitRate)) sampleRate=\(Self.debugOptional(format.sampleRate))"
+    }
+
+    private var cachedStatusDescription: String {
+        Self.debugOptional(cachedStatus)
+    }
+
+    private func debugTime(_ date: Date?) -> String {
+        guard let date else {
+            return "-"
+        }
+
+        return date.formatted(date: .omitted, time: .standard)
+    }
+
+    private static func debugQuote(_ value: String?) -> String {
+        guard let value else {
+            return "-"
+        }
+
+        return "\"\(value)\""
+    }
+
+    private static func debugOptional<T>(_ value: T?) -> String {
+        guard let value else {
+            return "-"
+        }
+
+        return "\(value)"
+    }
+
+    private static func debugDurationInt(_ value: Double?) -> String {
+        guard let value else {
+            return "-"
+        }
+
+        return "\(Int(value))"
+    }
+
+    private func titlesMatch(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.precomposedStringWithCanonicalMapping == rhs.precomposedStringWithCanonicalMapping
+    }
+
+    private func durationsMatch(_ lhs: Double, _ rhs: Double) -> Bool {
+        integerSeconds(lhs) == integerSeconds(rhs)
+    }
+
+}
+
+private final class AppleMusicLogStream: @unchecked Sendable {
+    struct Entry: Sendable {
+        let date: Date
+        let message: String
+
+        init(date: Date, message: String) {
+            self.date = date
+            self.message = message
+        }
+
+        init(event: AppleMusicLogEvent) {
+            self.date = event.date
+            self.message = event.message
+        }
+    }
+
+    struct Snapshot: Sendable {
+        let isRunning: Bool
+        let entries: [Entry]
+    }
+
+    private let queue = DispatchQueue(label: "isLossless.apple-music-log-stream")
+    private var process: Process?
+    private var outputPipe: Pipe?
+    private var errorPipe: Pipe?
+    private var eventBuffer = AppleMusicLogEventBuffer()
+    private var entries: [Entry] = []
+    private var isRunning = false
+    private let retentionInterval: TimeInterval = 300
+    private let onEntries: ([Entry]) -> Void
+
+    init(_ onEntries: @escaping ([Entry]) -> Void) {
+        self.onEntries = onEntries
+    }
+
+    func start() {
+        queue.async { [weak self] in
+            self?.startOnQueue()
+        }
+    }
+
+    func stop() {
+        queue.sync {
+            stopOnQueue()
+        }
+    }
+
+    func snapshot(since date: Date) -> Snapshot {
+        queue.sync {
+            pruneEntries(now: Date())
+            return Snapshot(
+                isRunning: isRunning,
+                entries: entriesForSnapshot(since: date)
+            )
+        }
+    }
+
+    private func startOnQueue() {
+        guard process == nil else {
+            return
+        }
+
+        let process = Process()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+        process.arguments = [
+            "stream",
+            "--style", "compact",
+            "--level", "debug",
+            "--predicate", Self.predicate
+        ]
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            self?.appendOutput(data)
+        }
+
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty,
+                  let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !message.isEmpty else {
+                return
+            }
+            print("[isLossless] log stream stderr: \(message)")
+        }
+
+        process.terminationHandler = { [weak self] process in
+            guard let logStream = self else { return }
+            logStream.queue.async {
+                logStream.isRunning = false
+                logStream.process = nil
+                logStream.outputPipe = nil
+                logStream.errorPipe = nil
+                print("[isLossless] log stream exited status=\(process.terminationStatus)")
+            }
+        }
+
+        do {
+            try process.run()
+            self.process = process
+            self.outputPipe = outputPipe
+            self.errorPipe = errorPipe
+            isRunning = true
+            print("[isLossless] log stream started")
+        } catch {
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            errorPipe.fileHandleForReading.readabilityHandler = nil
+            isRunning = false
+            print("[isLossless] log stream failed to start: \(error.localizedDescription)")
+        }
+    }
+
+    private func stopOnQueue() {
+        outputPipe?.fileHandleForReading.readabilityHandler = nil
+        errorPipe?.fileHandleForReading.readabilityHandler = nil
+        process?.terminationHandler = nil
+        if process?.isRunning == true {
+            process?.terminate()
+        }
+        process = nil
+        outputPipe = nil
+        errorPipe = nil
+        isRunning = false
+        eventBuffer.reset()
+    }
+
+    private func appendOutput(_ data: Data) {
+        guard let text = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        queue.async { [weak self] in
+            self?.consume(text)
+        }
+    }
+
+    private func consume(_ text: String) {
+        let newEntries = eventBuffer.ingest(text, date: Date()).map(Entry.init(event:))
+        guard !newEntries.isEmpty else {
+            return
+        }
+
+        entries.append(contentsOf: newEntries)
+        pruneEntries(now: Date())
+        onEntries(newEntries)
+    }
+
+    private func entriesForSnapshot(since date: Date) -> [Entry] {
+        var snapshotEntries = entries.filter { $0.date >= date }
+        if let currentEntry = eventBuffer.currentEntry(),
+           currentEntry.date >= date {
+            snapshotEntries.append(Entry(event: currentEntry))
+        }
+        return snapshotEntries
+    }
+
+    private func pruneEntries(now: Date) {
+        let cutoff = now.addingTimeInterval(-retentionInterval)
+        entries.removeAll { $0.date < cutoff }
+    }
+
+    private static let predicate = """
+    process == "Music" AND (subsystem == "com.apple.amp.mediaplaybackcore" OR eventMessage CONTAINS[c] "item-begin" OR eventMessage CONTAINS[c] "audio-format-changed" OR eventMessage CONTAINS[c] "PlaybackEventStream" OR eventMessage CONTAINS[c] "Engagement" OR eventMessage CONTAINS[c] "PBAudioFormat" OR eventMessage CONTAINS[c] "Audio format changed")
+    """
 }
 
 private extension AudioFormat {
@@ -1311,13 +2039,24 @@ private extension AudioFormat {
     }
 
     func preservingBitDepth(from other: AudioFormat?) -> AudioFormat {
-        let resolvedCodec = codecWithALACPriority(other?.codec)
+        let resolvedCodec = codec ?? other?.codec
 
         return AudioFormat(
             codec: resolvedCodec,
             bitDepth: bitDepth,
             bitRate: resolvedCodec == "ALAC" ? nil : (other?.bitRate ?? bitRate),
             sampleRate: other?.sampleRate ?? sampleRate
+        )
+    }
+
+    func fillingMissingFields(from other: AudioFormat?) -> AudioFormat {
+        let resolvedCodec = codec ?? other?.codec
+
+        return AudioFormat(
+            codec: resolvedCodec,
+            bitDepth: bitDepth ?? other?.bitDepth,
+            bitRate: resolvedCodec == "ALAC" ? nil : (bitRate ?? other?.bitRate),
+            sampleRate: sampleRate ?? other?.sampleRate
         )
     }
 
@@ -1352,9 +2091,110 @@ private extension AudioFormat {
         case "ALAC":
             return sampleRate != nil
         case "AAC":
-            return bitRate != nil
+            return true
         default:
             return !isEmpty
+        }
+    }
+}
+
+final class LocalAudioFormatReader {
+    func format(for url: URL) -> Result<AudioFormat, Error> {
+        var audioFile: AudioFileID?
+        let openStatus = AudioFileOpenURL(url as CFURL, .readPermission, 0, &audioFile)
+        guard openStatus == noErr, let audioFile else {
+            return .failure(LocalAudioFormatError.openFailed(openStatus))
+        }
+        defer {
+            AudioFileClose(audioFile)
+        }
+
+        var description = AudioStreamBasicDescription()
+        var descriptionSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let descriptionStatus = AudioFileGetProperty(
+            audioFile,
+            kAudioFilePropertyDataFormat,
+            &descriptionSize,
+            &description
+        )
+        guard descriptionStatus == noErr else {
+            return .failure(LocalAudioFormatError.dataFormatUnavailable(descriptionStatus))
+        }
+
+        let codec = codecName(for: description.mFormatID)
+        let bitDepth = description.mBitsPerChannel > 0 ? Int(description.mBitsPerChannel) : nil
+        let sampleRate = description.mSampleRate > 0 ? description.mSampleRate : nil
+        let bitRate = bitRate(for: audioFile)
+        let format = AudioFormat(
+            codec: codec,
+            bitDepth: bitDepth,
+            bitRate: bitRate,
+            sampleRate: sampleRate
+        )
+
+        guard codec != nil,
+              format.isReadyForDisplay else {
+            return .failure(LocalAudioFormatError.unsupportedFormat(Self.fourCharacterCode(description.mFormatID)))
+        }
+
+        return .success(format)
+    }
+
+    private func codecName(for formatID: AudioFormatID) -> String? {
+        if formatID == kAudioFormatAppleLossless {
+            return "ALAC"
+        }
+
+        let fourCC = Self.fourCharacterCode(formatID).lowercased()
+        if fourCC.contains("aac") || formatID == kAudioFormatMPEG4AAC {
+            return "AAC"
+        }
+
+        return nil
+    }
+
+    private func bitRate(for audioFile: AudioFileID) -> Int? {
+        var bitRate = UInt32()
+        var bitRateSize = UInt32(MemoryLayout<UInt32>.size)
+        let bitRateStatus = AudioFileGetProperty(
+            audioFile,
+            kAudioFilePropertyBitRate,
+            &bitRateSize,
+            &bitRate
+        )
+
+        guard bitRateStatus == noErr, bitRate > 0 else {
+            return nil
+        }
+
+        return Int((Double(bitRate) / 1_000).rounded())
+    }
+
+    private static func fourCharacterCode(_ value: UInt32) -> String {
+        let bytes = [
+            UInt8((value >> 24) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8(value & 0xff)
+        ]
+
+        return String(bytes: bytes, encoding: .macOSRoman) ?? "\(value)"
+    }
+
+    private enum LocalAudioFormatError: LocalizedError {
+        case openFailed(OSStatus)
+        case dataFormatUnavailable(OSStatus)
+        case unsupportedFormat(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .openFailed(let status):
+                return "AudioFileOpenURL failed status=\(status)"
+            case .dataFormatUnavailable(let status):
+                return "AudioFileGetProperty data format failed status=\(status)"
+            case .unsupportedFormat(let formatID):
+                return "Unsupported local audio format id=\(formatID)"
+            }
         }
     }
 }
@@ -1369,20 +2209,26 @@ private extension Array where Element == String {
     }
 }
 
+private extension UInt32 {
+    var nonZeroInt: Int? {
+        self > 0 ? Int(self) : nil
+    }
+}
+
 struct AudioOutputSnapshot: Sendable {
-    let name: String?
     let sampleRate: Double?
+    let bitDepth: Int?
 }
 
 final class AudioOutputReader {
     func currentOutput() -> AudioOutputSnapshot {
         guard let deviceID = defaultOutputDeviceID() else {
-            return AudioOutputSnapshot(name: nil, sampleRate: nil)
+            return AudioOutputSnapshot(sampleRate: nil, bitDepth: nil)
         }
 
         return AudioOutputSnapshot(
-            name: deviceName(for: deviceID),
-            sampleRate: nominalSampleRate(for: deviceID)
+            sampleRate: nominalSampleRate(for: deviceID),
+            bitDepth: outputBitDepth(for: deviceID)
         )
     }
 
@@ -1406,23 +2252,6 @@ final class AudioOutputReader {
         return status == noErr ? deviceID : nil
     }
 
-    private func deviceName(for deviceID: AudioDeviceID) -> String? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioObjectPropertyName,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var unmanagedName: Unmanaged<CFString>?
-        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &unmanagedName)
-
-        guard status == noErr, let unmanagedName else {
-            return nil
-        }
-
-        return unmanagedName.takeRetainedValue() as String
-    }
-
     private func nominalSampleRate(for deviceID: AudioDeviceID) -> Double? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyNominalSampleRate,
@@ -1434,6 +2263,56 @@ final class AudioOutputReader {
         let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &sampleRate)
 
         return status == noErr ? sampleRate : nil
+    }
+
+    private func outputBitDepth(for deviceID: AudioDeviceID) -> Int? {
+        outputStreamIDs(for: deviceID)
+            .compactMap(streamBitDepth)
+            .max()
+    }
+
+    private func outputStreamIDs(for deviceID: AudioDeviceID) -> [AudioStreamID] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size) == noErr,
+              size >= MemoryLayout<AudioStreamID>.size else {
+            return []
+        }
+
+        let count = Int(size) / MemoryLayout<AudioStreamID>.size
+        var streams = [AudioStreamID](repeating: 0, count: count)
+        let status = streams.withUnsafeMutableBufferPointer { buffer in
+            guard let baseAddress = buffer.baseAddress else {
+                return OSStatus(kAudioHardwareBadObjectError)
+            }
+
+            return AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, baseAddress)
+        }
+
+        return status == noErr ? streams : []
+    }
+
+    private func streamBitDepth(for streamID: AudioStreamID) -> Int? {
+        streamFormat(for: streamID, selector: kAudioStreamPropertyPhysicalFormat)?.mBitsPerChannel.nonZeroInt
+            ?? streamFormat(for: streamID, selector: kAudioStreamPropertyVirtualFormat)?.mBitsPerChannel.nonZeroInt
+    }
+
+    private func streamFormat(for streamID: AudioStreamID, selector: AudioObjectPropertySelector) -> AudioStreamBasicDescription? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var description = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let status = AudioObjectGetPropertyData(streamID, &address, 0, nil, &size, &description)
+
+        return status == noErr ? description : nil
     }
 }
 
