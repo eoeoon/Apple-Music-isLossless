@@ -11,7 +11,7 @@ public struct MenuBarTitleFormatter: Sendable {
         switch status {
         case .detected:
             return "—"
-        case .detecting:
+        case .detecting, .failed, .unverifiedLossless:
             return "—"
         default:
             return "isLossless"
@@ -20,7 +20,9 @@ public struct MenuBarTitleFormatter: Sendable {
 
     public func detectedTitle(for format: AudioFormat) -> String {
         if format.codec == "AAC" {
-            let parts = [format.codec, format.bitRate.map { "\($0)kbps" }].compactMap { $0 }
+            let detail = format.bitRate.map { "\($0)kbps" }
+                ?? format.sampleRate.map(formatSampleRate)
+            let parts = [format.codec, detail].compactMap { $0 }
             return parts.isEmpty ? "—" : parts.joined(separator: " ")
         }
 

@@ -9,4 +9,5 @@ public enum DetectionStatus: Equatable, Sendable {
     case detected
     case permissionRequired
     case failed
+    case unverifiedLossless
 }
