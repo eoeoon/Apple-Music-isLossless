@@ -26,9 +26,16 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menuSlidingTextViews: [String: SlidingTextView] = [:]
     private var synchronizedSlidingGroups: [String: SynchronizedSlidingGroup] = [:]
     private var menuImageViews: [String: NSImageView] = [:]
+    private var menuIndicatorViews: [String: NSView] = [:]
+    private var menuBarContentView: MenuBarStatusContentView?
     private var isMenuOpen = false
     private var pendingCacheRefreshWorkItem: DispatchWorkItem?
+    private var pendingOutputRefreshWorkItem: DispatchWorkItem?
+    private var pendingOutputSwitchSettlingWorkItem: DispatchWorkItem?
+    private var isOutputSwitchSettling = false
     private let outputObserver = AudioOutputObserver()
+    private let outputSwitchCoordinator = AutomaticOutputSwitchCoordinator()
+    private let predictionCoordinator = PreloadPredictionCoordinator()
 
     private enum MenuLayout {
         static let width: CGFloat = 296
@@ -86,8 +93,11 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        monitor.preloadCacheDidChange = { [weak self] in
-            self?.refresh(forceLogScan: false)
+        monitor.preloadCacheDidChange = { [weak self] changes in
+            self?.handlePreloadCacheChanges(changes)
+        }
+        predictionCoordinator.onPendingStateChanged = { [weak self] isPending in
+            self?.setOutputPredictionPending(isPending)
         }
         monitor.startLogStream()
         configureMenu()
@@ -101,6 +111,9 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         DistributedNotificationCenter.default().removeObserver(self)
         pendingCacheRefreshWorkItem?.cancel()
+        pendingOutputRefreshWorkItem?.cancel()
+        pendingOutputSwitchSettlingWorkItem?.cancel()
+        predictionCoordinator.cancel(reason: "app-terminating")
         monitor.stopLogStream()
         outputObserver.stop()
     }
@@ -117,9 +130,106 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         applyState(monitor.snapshot(forceLogScan: forceLogScan))
     }
 
+    private func handlePreloadCacheChanges(_ changes: [PreloadCacheChange]) {
+        for change in changes {
+            if case .queueSnapshot(let result) = change {
+                predictionCoordinator.cancelIfPendingReordered(result)
+            }
+        }
+
+        if changes.contains(where: shouldRefreshAfterPreloadChange) {
+            refresh(forceLogScan: false)
+        }
+
+        if changes.contains(where: shouldApplyEventPredictionAfterPreloadChange) {
+            applyEventPredictionIfPossible()
+        }
+    }
+
+    private func shouldRefreshAfterPreloadChange(_ change: PreloadCacheChange) -> Bool {
+        switch change {
+        case .playbackFormatPromoted:
+            return true
+
+        case .currentQueueFormatResolved:
+            return true
+
+        case .playbackTick, .queueLink, .queueSnapshot:
+            return false
+
+        case .savedFormatOnly(let record):
+            return isPotentialNextPreloadRecord(record)
+
+        case .enrichedMetadata(let record), .savedCompleted(let record):
+            return isCurrentOrNextPreloadRecord(record)
+                || matchesCurrentTrackMetadata(record)
+                || isPotentialNextPreloadRecord(record)
+        }
+    }
+
+    private func shouldApplyEventPredictionAfterPreloadChange(_ change: PreloadCacheChange) -> Bool {
+        switch change {
+        case .playbackTick, .queueLink, .queueSnapshot, .currentQueueFormatResolved, .savedFormatOnly:
+            return true
+        case .enrichedMetadata, .savedCompleted, .playbackFormatPromoted:
+            return false
+        }
+    }
+
+    private func isCurrentOrNextPreloadRecord(_ record: AppleMusicPreloadRecord) -> Bool {
+        record.queueItemID == state.currentPreloadRecord?.queueItemID
+            || record.queueItemID == state.nextPreloadRecord?.queueItemID
+    }
+
+    private func isPotentialNextPreloadRecord(_ record: AppleMusicPreloadRecord) -> Bool {
+        guard let currentRecord = state.currentPreloadRecord,
+              record.queueItemID > currentRecord.queueItemID else {
+            return false
+        }
+
+        if let currentSectionID = currentRecord.queueSectionID,
+           record.queueSectionID != currentSectionID {
+            return false
+        }
+
+        if let nextRecord = state.nextPreloadRecord {
+            return record.queueItemID <= nextRecord.queueItemID
+        }
+
+        return true
+    }
+
+    private func matchesCurrentTrackMetadata(_ record: AppleMusicPreloadRecord) -> Bool {
+        guard let recordTitle = record.title,
+              let recordDuration = record.duration,
+              let trackTitle = state.trackTitle,
+              let trackDuration = state.trackDuration else {
+            return false
+        }
+
+        return recordTitle.precomposedStringWithCanonicalMapping == trackTitle.precomposedStringWithCanonicalMapping
+            && Int(recordDuration) == Int(trackDuration)
+    }
+
     private func applyState(_ newState: AppState) {
         let oldLayoutIdentity = state.menuLayoutIdentity
         state = newState
+        predictionCoordinator.observeState(state.predictionState)
+        let outputSwitchSuppressionFields = monitor.outputSwitchSuppressionFields(for: state)
+        let shouldDeferOutputSwitch = outputSwitchSuppressionFields == nil
+            && predictionCoordinator.shouldDeferOutputSwitch(for: state.predictionState)
+
+        if let suppressionFields = outputSwitchSuppressionFields {
+            print("[isLossless] output.switch action=skipped \(suppressionFields)")
+        } else if !shouldDeferOutputSwitch {
+            let result = outputSwitchCoordinator.applyIfNeeded(for: state)
+            beginOutputSwitchSettlingIfNeeded(result)
+            refreshOutputAfterSwitchIfNeeded(result)
+        }
+        state.hasPendingOutputPrediction = predictionCoordinator.hasPendingPrediction
+        state.hasMatchingOutputPrediction = !state.hasPendingOutputPrediction
+            && isMatchingFormatPredictionAvailable(for: state.predictionState)
+        state.isStatusMarkerTransitioning = outputSwitchSuppressionFields != nil
         scheduleCacheRefreshIfNeeded(after: newState.refreshAfter)
         updateMenuBarTitle()
         if isMenuOpen {
@@ -130,6 +240,134 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         } else {
             populateMenu(menu)
+        }
+    }
+
+    private func applyEventPredictionIfPossible() {
+        let eventState = monitor.eventPredictionState()
+        _ = predictionCoordinator.applyEventPrediction(
+            for: eventState,
+            validate: { [weak self] in
+                self?.monitor.eventPredictionState() ?? PreloadPredictionState(playbackState: .notRunning)
+            }
+        ) { [weak self] record, trackIdentity, previousQueueItemID in
+            self?.applyPredictionOutput(
+                record,
+                trackIdentity: trackIdentity,
+                previousQueueItemID: previousQueueItemID
+            )
+        }
+        setOutputPredictionPending(
+            predictionCoordinator.hasPendingPrediction,
+            predictionState: eventState
+        )
+    }
+
+    private func setOutputPredictionPending(
+        _ isPending: Bool,
+        predictionState: PreloadPredictionState? = nil
+    ) {
+        let isMatching = !isPending
+            && isMatchingFormatPredictionAvailable(for: predictionState ?? state.predictionState)
+        guard state.hasPendingOutputPrediction != isPending
+                || state.hasMatchingOutputPrediction != isMatching else {
+            updateOutputPredictionIndicator()
+            updateMenuBarTitle()
+            return
+        }
+
+        state.hasPendingOutputPrediction = isPending
+        state.hasMatchingOutputPrediction = isMatching
+        updateOutputPredictionIndicator()
+        updateMenuBarTitle()
+    }
+
+    private func isMatchingFormatPredictionAvailable(for predictionState: PreloadPredictionState) -> Bool {
+        guard predictionState.playbackState == .playing,
+              let currentFormat = predictionState.currentRecord?.format,
+              let nextFormat = predictionState.nextRecord?.format else {
+            return false
+        }
+
+        return currentFormat.sampleRate == nextFormat.sampleRate
+            && currentFormat.bitDepth == nextFormat.bitDepth
+    }
+
+    private func applyPredictionOutput(
+        _ record: AppleMusicPreloadRecord,
+        trackIdentity: String?,
+        previousQueueItemID: Int
+    ) -> AudioOutputSwitchResult? {
+        let result = outputSwitchCoordinator.applyPrediction(
+            format: record.format,
+            trackIdentity: trackIdentity,
+            queueItemID: record.queueItemID
+        )
+        if result?.shouldRefreshOutputSnapshot == true {
+            monitor.rememberAppliedPrediction(
+                record,
+                previousTrackIdentity: trackIdentity,
+                previousQueueItemID: previousQueueItemID
+            )
+        }
+        beginOutputSwitchSettlingIfNeeded(result)
+        refreshOutputAfterSwitchIfNeeded(result)
+        return result
+    }
+
+    private func refreshOutputAfterSwitchIfNeeded(_ result: AudioOutputSwitchResult?) {
+        guard let result,
+              result.shouldRefreshOutputSnapshot else {
+            return
+        }
+
+        refreshOutputSnapshot()
+
+        pendingOutputRefreshWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.refreshOutputSnapshot()
+            }
+        }
+        pendingOutputRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: workItem)
+    }
+
+    private func beginOutputSwitchSettlingIfNeeded(_ result: AudioOutputSwitchResult?) {
+        guard result?.didApplyOutputChange == true else {
+            return
+        }
+
+        isOutputSwitchSettling = true
+        pendingOutputSwitchSettlingWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self else {
+                    return
+                }
+
+                self.isOutputSwitchSettling = false
+                self.updateMenuBarTitle()
+            }
+        }
+        pendingOutputSwitchSettlingWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: workItem)
+    }
+
+    private func refreshOutputSnapshot() {
+        let output = monitor.currentOutput()
+        guard output.sampleRate != state.outputSampleRate
+            || output.bitDepth != state.outputBitDepth else {
+            return
+        }
+
+        state.outputSampleRate = output.sampleRate
+        state.outputBitDepth = output.bitDepth
+        updateMenuBarTitle()
+
+        if isMenuOpen {
+            updateMenuLabels()
         }
     }
 
@@ -189,56 +427,88 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        let font = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        let marker = currentMenuBarStatusMarker()
+
         if state.status == .unverifiedLossless,
            let icon = iconProvider.inactiveIcon {
-            button.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-            let statusImage: NSImage
-            if let sampleRate = state.unverifiedSampleRate {
-                let title = iconProvider.titleBeforeIcon(for: formatter.formatSampleRate(sampleRate))
-                statusImage = iconProvider.statusImage(for: icon, title: title, font: button.font ?? .systemFont(ofSize: NSFont.systemFontSize))
-            } else {
-                statusImage = iconProvider.iconOnlyStatusImage(for: icon)
-            }
-            statusItem.length = iconProvider.itemLength(for: statusImage)
-            button.title = ""
-            button.image = statusImage
-            button.imagePosition = .imageOnly
-            button.imageHugsTitle = true
-            button.imageScaling = .scaleNone
-            button.contentTintColor = nil
+            let title = state.unverifiedSampleRate.map(formatter.formatSampleRate) ?? ""
+            configureMenuBarButton(button, title: title, icon: icon, marker: marker, font: font)
         } else if let icon = iconProvider.icon(for: state.format),
            let detail = iconProvider.detailText(for: state.format, formatter: formatter) {
-            button.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-            let title = iconProvider.titleBeforeIcon(for: detail)
-            let statusImage = iconProvider.statusImage(for: icon, title: title, font: button.font ?? .systemFont(ofSize: NSFont.systemFontSize))
-            statusItem.length = iconProvider.itemLength(for: statusImage)
-            button.title = ""
-            button.image = statusImage
-            button.imagePosition = .imageOnly
-            button.imageHugsTitle = true
-            button.imageScaling = .scaleNone
-            button.contentTintColor = nil
+            configureMenuBarButton(button, title: detail, icon: icon, marker: marker, font: font)
         } else {
             let title = formatter.title(for: state.format, status: state.status)
-            if iconProvider.shouldUseInactiveIcon(for: title), let icon = iconProvider.inactiveIcon {
-                let statusImage = iconProvider.iconOnlyStatusImage(for: icon)
-                statusItem.length = iconProvider.itemLength(for: statusImage)
-                button.title = ""
-                button.image = statusImage
-                button.imagePosition = .imageOnly
-                button.imageHugsTitle = true
-                button.imageScaling = .scaleNone
-                button.contentTintColor = nil
-            } else {
-                statusItem.length = NSStatusItem.variableLength
-                button.image = nil
-                button.title = title
-                button.imageHugsTitle = true
-                button.contentTintColor = nil
-            }
+            let shouldUseInactiveIcon = iconProvider.shouldUseInactiveIcon(for: title)
+            let icon = shouldUseInactiveIcon ? iconProvider.inactiveIcon : nil
+            let shouldHideInactiveTitle = shouldUseInactiveIcon
+                && icon != nil
+                && (marker == .none || state.status == .failed)
+            let displayTitle = shouldHideInactiveTitle ? "" : title
+            configureMenuBarButton(button, title: displayTitle, icon: icon, marker: marker, font: font)
         }
-        button.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         button.toolTip = state.accessibilityDescription
+    }
+
+    private func currentMenuBarStatusMarker() -> MenuBarStatusMarker {
+        MenuBarStatusMarkerPolicy.marker(
+            detectionStatus: state.status,
+            currentFormat: state.format,
+            outputSampleRate: state.outputSampleRate,
+            outputBitDepth: state.outputBitDepth,
+            isTransitioning: isMenuBarStatusMarkerTransitioning
+        )
+    }
+
+    private var isMenuBarStatusMarkerTransitioning: Bool {
+        state.isStatusMarkerTransitioning
+            || isOutputSwitchSettling
+    }
+
+    private func configureMenuBarButton(
+        _ button: NSStatusBarButton,
+        title: String,
+        icon: NSImage?,
+        marker: MenuBarStatusMarker,
+        font: NSFont
+    ) {
+        button.font = font
+        button.title = ""
+        button.attributedTitle = NSAttributedString(string: "")
+        if let icon {
+            let contentView = menuBarStatusContentView(for: button)
+            contentView.configure(title: title, icon: icon, marker: marker, font: font)
+            statusItem.length = ceil(contentView.fittingSize.width)
+            button.image = nil
+            button.imagePosition = .noImage
+        } else {
+            menuBarContentView?.removeFromSuperview()
+            menuBarContentView = nil
+            statusItem.length = NSStatusItem.variableLength
+            button.image = nil
+            button.title = title
+            button.imagePosition = .noImage
+        }
+        button.imageHugsTitle = true
+        button.imageScaling = .scaleProportionallyDown
+        button.contentTintColor = nil
+    }
+
+    private func menuBarStatusContentView(for button: NSStatusBarButton) -> MenuBarStatusContentView {
+        if let menuBarContentView,
+           menuBarContentView.superview === button {
+            return menuBarContentView
+        }
+
+        let contentView = MenuBarStatusContentView()
+        button.addSubview(contentView)
+        NSLayoutConstraint.activate([
+            contentView.leadingAnchor.constraint(equalTo: button.leadingAnchor),
+            contentView.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+            contentView.centerYAnchor.constraint(equalTo: button.centerYAnchor)
+        ])
+        menuBarContentView = contentView
+        return contentView
     }
 
     private func configureMenu() {
@@ -266,6 +536,7 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menuSlidingTextViews.removeAll()
         synchronizedSlidingGroups.removeAll()
         menuImageViews.removeAll()
+        menuIndicatorViews.removeAll()
 
         menu.addItem(headerItem())
         menu.addItem(analysisItem())
@@ -297,8 +568,18 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menuSlidingTextViews["track-artist"]?.stringValue = artistText
         synchronizedSlidingGroups["track-metadata"]?.restart()
         menuImageViews["analysis-detail-icon"]?.image = analysisDetailIcon
-        menuLabels["format-detail"]?.stringValue = formatText
+        menuLabels["format-title"]?.stringValue = formatTitleText
+        menuSlidingTextViews["format-detail"]?.stringValue = formatText
         menuLabels["output-detail"]?.stringValue = outputText
+        updateOutputPredictionIndicator()
+    }
+
+    private func updateOutputPredictionIndicator() {
+        guard let indicator = menuIndicatorViews["output-prediction-dot"] else {
+            return
+        }
+
+        applyOutputPredictionIndicatorStyle(to: indicator)
     }
 
     private func quitMenuItem() -> NSMenuItem {
@@ -412,18 +693,20 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let item = NSMenuItem()
 
         let formatColumn = twoLineInfoColumn(
-            title: "포맷",
+            title: formatTitleText,
             detail: formatText,
             titleKey: "format-title",
             detailKey: "format-detail",
-            width: MenuLayout.formatOutputFormatColumnWidth
+            width: MenuLayout.formatOutputFormatColumnWidth,
+            slidesDetail: true
         )
         let outputColumn = twoLineInfoColumn(
             title: "출력",
             detail: outputText,
             titleKey: "output-title",
             detailKey: "output-detail",
-            width: MenuLayout.analysisColumnWidth
+            width: MenuLayout.analysisColumnWidth,
+            indicatorKey: "output-prediction-dot"
         )
         let arrowView = formatOutputArrowView()
 
@@ -451,24 +734,61 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    private func twoLineInfoColumn(title: String, detail: String, titleKey: String, detailKey: String, width: CGFloat) -> NSView {
+    private func twoLineInfoColumn(
+        title: String,
+        detail: String,
+        titleKey: String,
+        detailKey: String,
+        width: CGFloat,
+        slidesDetail: Bool = false,
+        indicatorKey: String? = nil
+    ) -> NSView {
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = .systemFont(ofSize: MenuLayout.bodyFontSize, weight: .semibold)
+        titleLabel.font = .systemFont(ofSize: MenuLayout.bodyFontSize, weight: .medium)
         titleLabel.textColor = .labelColor
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.maximumNumberOfLines = 1
         menuLabels[titleKey] = titleLabel
 
-        let detailLabel = NSTextField(labelWithString: detail)
-        detailLabel.font = .systemFont(ofSize: MenuLayout.bodyFontSize, weight: .regular)
-        detailLabel.textColor = .labelColor
-        detailLabel.lineBreakMode = .byTruncatingTail
-        detailLabel.maximumNumberOfLines = 1
-        menuLabels[detailKey] = detailLabel
+        let titleView: NSView
+        if let indicatorKey {
+            let indicator = predictionIndicatorView()
+            applyOutputPredictionIndicatorStyle(to: indicator)
+            menuIndicatorViews[indicatorKey] = indicator
+
+            let titleStack = NSStackView(views: [titleLabel, indicator])
+            titleStack.orientation = .horizontal
+            titleStack.alignment = .centerY
+            titleStack.spacing = 5
+            titleView = titleStack
+        } else {
+            titleView = titleLabel
+        }
+
+        let detailView: NSView
+        if slidesDetail {
+            let slidingText = SlidingTextView(
+                width: width,
+                height: MenuLayout.analysisDetailRowHeight,
+                font: .systemFont(ofSize: MenuLayout.bodyFontSize, weight: .regular),
+                textColor: .labelColor
+            )
+            slidingText.stringValue = detail
+            menuSlidingTextViews[detailKey] = slidingText
+            detailView = slidingText
+        } else {
+            let detailLabel = NSTextField(labelWithString: detail)
+            detailLabel.font = .systemFont(ofSize: MenuLayout.bodyFontSize, weight: .regular)
+            detailLabel.textColor = .labelColor
+            detailLabel.lineBreakMode = .byTruncatingTail
+            detailLabel.maximumNumberOfLines = 1
+            menuLabels[detailKey] = detailLabel
+            detailView = detailLabel
+        }
 
         let column = NSStackView(views: [
-            fixedHeightRow(containing: titleLabel, width: width),
-            fixedHeightRow(containing: detailLabel, width: width)
+            fixedHeightRow(containing: titleView, width: width),
+            fixedHeightRow(containing: detailView, width: width)
         ])
         column.orientation = .vertical
         column.alignment = .leading
@@ -476,6 +796,39 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         column.translatesAutoresizingMaskIntoConstraints = false
         column.widthAnchor.constraint(equalToConstant: width).isActive = true
         return column
+    }
+
+    private func predictionIndicatorView() -> NSView {
+        let view = NSView()
+        view.wantsLayer = true
+        view.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            view.widthAnchor.constraint(equalToConstant: 7),
+            view.heightAnchor.constraint(equalToConstant: 7)
+        ])
+        return view
+    }
+
+    private func applyOutputPredictionIndicatorStyle(to view: NSView) {
+        view.wantsLayer = true
+        view.layer?.cornerRadius = 3.5
+
+        if state.hasPendingOutputPrediction {
+            view.isHidden = false
+            view.layer?.backgroundColor = NSColor.systemBlue.cgColor
+            view.layer?.borderWidth = 0
+            view.layer?.borderColor = nil
+        } else if state.hasMatchingOutputPrediction {
+            view.isHidden = false
+            view.layer?.backgroundColor = NSColor.clear.cgColor
+            view.layer?.borderWidth = 1.25
+            view.layer?.borderColor = NSColor.systemBlue.cgColor
+        } else {
+            view.isHidden = true
+            view.layer?.backgroundColor = NSColor.clear.cgColor
+            view.layer?.borderWidth = 0
+            view.layer?.borderColor = nil
+        }
     }
 
     private func formatOutputArrowView() -> NSView {
@@ -569,7 +922,32 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         state.statusText
     }
 
+    private var formatTitleText: String {
+        if hasCurrentTrack,
+           state.status == .failed {
+            return "알 수 없음"
+        }
+
+        guard hasCurrentTrack,
+              state.status == .detected,
+              let codec = state.format?.codec else {
+            return "—"
+        }
+
+        switch codec {
+        case "ALAC", "AAC":
+            return codec
+        default:
+            return "—"
+        }
+    }
+
     private var formatText: String {
+        if hasCurrentTrack,
+           state.status == .failed {
+            return "정보를 불러오려면 다른 곡을 재생하거나 이 곡을 다시 재생하십시오."
+        }
+
         guard hasCurrentTrack,
               state.status == .detected,
               let format = state.format else {
@@ -658,10 +1036,6 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 }
 
 private struct MenuBarIconProvider {
-    private static let leadingPadding: CGFloat = 0
-    private static let trailingPadding: CGFloat = 1
-    private static let statusImageHeight: CGFloat = 18
-    private static let iconVerticalOffset: CGFloat = -1
     private let losslessIcon = Self.loadIcon(named: "isLossless_logo_black", targetHeight: 14)
     private let otherIcon = Self.loadIcon(named: "isLossless_logo_crossed_black", targetHeight: 14)
     private let menuLosslessIcon = Self.loadIcon(named: "isLossless_logo_black", targetHeight: 36)
@@ -709,62 +1083,6 @@ private struct MenuBarIconProvider {
         default:
             return nil
         }
-    }
-
-    func titleBeforeIcon(for detail: String) -> String {
-        "\(detail)  "
-    }
-
-    func statusImage(for icon: NSImage, title: String, font: NSFont) -> NSImage {
-        statusImage(for: icon, title: title, font: font, minimumWidth: 0)
-    }
-
-    func iconOnlyStatusImage(for icon: NSImage) -> NSImage {
-        statusImage(
-            for: icon,
-            title: "",
-            font: .systemFont(ofSize: NSFont.systemFontSize, weight: .regular),
-            minimumWidth: max(18, icon.size.width + Self.leadingPadding + Self.trailingPadding)
-        )
-    }
-
-    private func statusImage(for icon: NSImage, title: String, font: NSFont, minimumWidth: CGFloat) -> NSImage {
-        let text = title as NSString
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.black
-        ]
-        let textSize = text.size(withAttributes: attributes)
-        let textWidth = ceil(textSize.width)
-        let contentWidth = ceil(Self.leadingPadding + textWidth + icon.size.width + Self.trailingPadding)
-        let imageWidth = max(contentWidth, ceil(minimumWidth))
-        let imageSize = NSSize(width: imageWidth, height: Self.statusImageHeight)
-        let image = NSImage(size: imageSize)
-
-        image.lockFocus()
-        NSColor.clear.setFill()
-        NSRect(origin: .zero, size: imageSize).fill()
-
-        let textY = ((Self.statusImageHeight - textSize.height) / 2).rounded(.down)
-        if textWidth > 0 {
-            text.draw(at: NSPoint(x: Self.leadingPadding, y: textY), withAttributes: attributes)
-        }
-
-        let iconY = ((Self.statusImageHeight - icon.size.height) / 2).rounded(.down) + Self.iconVerticalOffset
-        let iconX = imageWidth - Self.trailingPadding - icon.size.width
-        icon.draw(
-            in: NSRect(x: iconX, y: iconY, width: icon.size.width, height: icon.size.height),
-            from: NSRect(origin: .zero, size: icon.size),
-            operation: .sourceOver,
-            fraction: 1
-        )
-        image.unlockFocus()
-        image.isTemplate = true
-        return image
-    }
-
-    func itemLength(for image: NSImage) -> CGFloat {
-        image.size.width
     }
 
     func shouldUseInactiveIcon(for title: String) -> Bool {
@@ -827,6 +1145,19 @@ private extension NSImage {
         inactiveImage.unlockFocus()
         inactiveImage.isTemplate = false
         return inactiveImage
+    }
+}
+
+private extension MarkerColor {
+    var nsColor: NSColor {
+        switch self {
+        case .green:
+            return .systemGreen
+        case .yellow:
+            return .systemYellow
+        case .red:
+            return .systemRed
+        }
     }
 }
 
@@ -1079,6 +1410,181 @@ final class SynchronizedSlidingGroup {
     }
 }
 
+private extension AudioOutputSwitchResult {
+    var didApplyOutputChange: Bool {
+        switch self {
+        case .applied:
+            return true
+        case .alreadyMatched, .failed:
+            return false
+        }
+    }
+}
+
+private final class MenuBarStatusContentView: NSView {
+    private enum Layout {
+        static let componentTopPadding: CGFloat = 1
+        static let trailingPadding: CGFloat = 1
+        static let textIconSpacing: CGFloat = 5
+        static let textBottomPadding: CGFloat = 1
+        static let markerTopPadding: CGFloat = 0.5
+        static let markerDiameter: CGFloat = 7
+        static let markerTrailingGap: CGFloat = 4
+    }
+
+    private let markerPaddingView = NSView()
+    private let markerView = MenuBarMarkerView()
+    private let textPaddingView = NSView()
+    private let textField = NSTextField(labelWithString: "")
+    private let imageView = NSImageView()
+    private let stackView = NSStackView()
+    private var imageWidthConstraint: NSLayoutConstraint?
+    private var imageHeightConstraint: NSLayoutConstraint?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+
+        textField.lineBreakMode = .byClipping
+        textField.maximumNumberOfLines = 1
+        textField.translatesAutoresizingMaskIntoConstraints = false
+        textField.setContentCompressionResistancePriority(.required, for: .horizontal)
+        textField.setContentHuggingPriority(.required, for: .horizontal)
+
+        textPaddingView.translatesAutoresizingMaskIntoConstraints = false
+        textPaddingView.addSubview(textField)
+        NSLayoutConstraint.activate([
+            textField.leadingAnchor.constraint(equalTo: textPaddingView.leadingAnchor),
+            textField.trailingAnchor.constraint(equalTo: textPaddingView.trailingAnchor),
+            textField.topAnchor.constraint(equalTo: textPaddingView.topAnchor),
+            textField.bottomAnchor.constraint(equalTo: textPaddingView.bottomAnchor, constant: -Layout.textBottomPadding)
+        ])
+
+        markerPaddingView.translatesAutoresizingMaskIntoConstraints = false
+        markerPaddingView.addSubview(markerView)
+        NSLayoutConstraint.activate([
+            markerView.widthAnchor.constraint(equalToConstant: Layout.markerDiameter),
+            markerView.heightAnchor.constraint(equalToConstant: Layout.markerDiameter),
+            markerView.leadingAnchor.constraint(equalTo: markerPaddingView.leadingAnchor),
+            markerView.trailingAnchor.constraint(equalTo: markerPaddingView.trailingAnchor),
+            markerView.topAnchor.constraint(equalTo: markerPaddingView.topAnchor, constant: Layout.markerTopPadding),
+            markerView.bottomAnchor.constraint(equalTo: markerPaddingView.bottomAnchor)
+        ])
+
+        imageView.imageScaling = .scaleProportionallyDown
+        imageView.setContentCompressionResistancePriority(.required, for: .horizontal)
+        imageView.setContentHuggingPriority(.required, for: .horizontal)
+        imageWidthConstraint = imageView.widthAnchor.constraint(equalToConstant: 0)
+        imageHeightConstraint = imageView.heightAnchor.constraint(equalToConstant: 0)
+        imageWidthConstraint?.isActive = true
+        imageHeightConstraint?.isActive = true
+
+        stackView.orientation = .horizontal
+        stackView.alignment = .centerY
+        stackView.spacing = 0
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+        stackView.addArrangedSubview(markerPaddingView)
+        stackView.addArrangedSubview(textPaddingView)
+        stackView.addArrangedSubview(imageView)
+        stackView.setCustomSpacing(Layout.markerTrailingGap, after: markerPaddingView)
+        stackView.setCustomSpacing(Layout.textIconSpacing, after: textPaddingView)
+
+        addSubview(stackView)
+        NSLayoutConstraint.activate([
+            stackView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stackView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Layout.trailingPadding),
+            stackView.topAnchor.constraint(equalTo: topAnchor, constant: Layout.componentTopPadding),
+            stackView.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override var fittingSize: NSSize {
+        var size = stackView.fittingSize
+        size.width += Layout.trailingPadding
+        size.height += Layout.componentTopPadding
+        return size
+    }
+
+    override var intrinsicContentSize: NSSize {
+        fittingSize
+    }
+
+    func configure(title: String, icon: NSImage, marker: MenuBarStatusMarker, font: NSFont) {
+        markerView.marker = marker
+        markerPaddingView.isHidden = marker == .none
+
+        textField.stringValue = title
+        textField.font = font
+        textField.textColor = .labelColor
+        textPaddingView.isHidden = title.isEmpty
+
+        imageView.image = icon
+        imageView.contentTintColor = icon.isTemplate ? .labelColor : nil
+        imageWidthConstraint?.constant = icon.size.width
+        imageHeightConstraint?.constant = icon.size.height
+        invalidateIntrinsicContentSize()
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+    }
+}
+
+private final class MenuBarMarkerView: NSView {
+    var marker: MenuBarStatusMarker = .none {
+        didSet {
+            needsDisplay = true
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let color: NSColor
+        let isFilled: Bool
+        switch marker {
+        case .none:
+            return
+        case .filled(let markerColor):
+            color = markerColor.nsColor
+            isFilled = true
+        case .outline(let markerColor):
+            color = markerColor.nsColor
+            isFilled = false
+        }
+
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(ovalIn: rect)
+        if isFilled {
+            color.setFill()
+            path.fill()
+        } else {
+            color.setStroke()
+            path.lineWidth = 1.25
+            path.stroke()
+        }
+    }
+}
+
 struct AppState: Sendable {
     var status: DetectionStatus = .idle
     var playbackStatus: PlaybackStatus = .unknown
@@ -1089,8 +1595,31 @@ struct AppState: Sendable {
     var albumName: String?
     var outputSampleRate: Double?
     var outputBitDepth: Int?
+    var appleScriptSampleRate: Double?
+    var trackDuration: Double?
+    var playerPosition: Double?
+    var currentPlaybackQueueItemID: Int?
+    var currentPlaybackQueueSectionID: Int?
+    var currentPreloadRecord: AppleMusicPreloadRecord?
+    var nextPreloadRecord: AppleMusicPreloadRecord?
+    var hasPendingOutputPrediction = false
+    var hasMatchingOutputPrediction = false
+    var isStatusMarkerTransitioning = false
     var refreshAfter: TimeInterval?
     var unverifiedSampleRate: Double?
+
+    var predictionState: PreloadPredictionState {
+        PreloadPredictionState(
+            trackIdentity: trackIdentity,
+            playbackState: playbackStatus.predictionPlaybackState,
+            duration: trackDuration,
+            playerPosition: playerPosition,
+            currentQueueItemID: currentPlaybackQueueItemID ?? currentPreloadRecord?.queueItemID,
+            currentQueueSectionID: currentPlaybackQueueSectionID ?? currentPreloadRecord?.queueSectionID,
+            currentRecord: currentPreloadRecord,
+            nextRecord: nextPreloadRecord
+        )
+    }
 
     var menuLayoutIdentity: String {
         trackTitle != nil || artistName != nil || albumName != nil ? "analysis-two-column" : "analysis-single-column"
@@ -1129,6 +1658,45 @@ enum PlaybackStatus: Sendable {
     case playing
 }
 
+struct PreloadPredictionState: Sendable {
+    var trackIdentity: String?
+    var playbackState: PreloadPredictionPlaybackState = .unknown
+    var duration: Double?
+    var playerPosition: Double?
+    var currentQueueItemID: Int? = nil
+    var currentQueueSectionID: Int? = nil
+    var currentRecord: AppleMusicPreloadRecord?
+    var nextRecord: AppleMusicPreloadRecord?
+}
+
+enum PreloadCacheChange: Sendable {
+    case savedFormatOnly(AppleMusicPreloadRecord)
+    case enrichedMetadata(AppleMusicPreloadRecord)
+    case savedCompleted(AppleMusicPreloadRecord)
+    case currentQueueFormatResolved(AppleMusicPreloadRecord)
+    case playbackTick(AppleMusicPlaybackItemTick)
+    case queueLink(AppleMusicAssetQueueLink)
+    case queueSnapshot(AppleMusicQueueSnapshotStoreResult)
+    case playbackFormatPromoted
+}
+
+private extension PlaybackStatus {
+    var predictionPlaybackState: PreloadPredictionPlaybackState {
+        switch self {
+        case .unknown:
+            return .unknown
+        case .notRunning:
+            return .notRunning
+        case .stopped:
+            return .stopped
+        case .paused:
+            return .paused
+        case .playing:
+            return .playing
+        }
+    }
+}
+
 @MainActor
 final class AppleMusicMonitor {
     private let parser = AppleMusicLogParser()
@@ -1147,24 +1715,48 @@ final class AppleMusicMonitor {
     private var currentTrackIdentity: String?
     private var currentTrackDetectionStartedAt: Date?
     private var currentTrackAppleScriptSampleRate: Double?
+    private var currentPreloadRecord: AppleMusicPreloadRecord?
+    private var currentPlaybackQueueItemID: Int?
+    private var currentPlaybackQueueSectionID: Int?
+    private var currentPlaybackPosition: Double?
+    private var currentPlaybackRemainingTime: Double?
+    private var currentPlaybackUpdatedAt: Date?
+    private var predictionTransitionGuard: PreloadPredictionTransitionGuard?
+    private var loggedStaleTransitionQueueItemIDs: Set<Int> = []
     private var cachedStatus: DetectionStatus?
     private var cachedFormatSource: FormatSource?
     private var cachedUnverifiedSampleRate: Double?
-    private let initialCacheLookupDelay: TimeInterval = 0.5
+    private var appliedPreloadPrediction: AppliedPreloadPrediction?
+    private let initialCacheLookupDelay: TimeInterval = 0.1
     private let cacheLookupWaitLimit: TimeInterval = 3
     private let playbackLosslessPromotionWindow: TimeInterval = 1
     private let playbackLosslessPromotionDeliveryTolerance: TimeInterval = 0.25
+    private let appliedPredictionAdoptionWindow: TimeInterval = 10
+    private let stalePlaybackTickProtectionWindow: TimeInterval = 8
     private let emptyCacheRetryInterval: TimeInterval = 0.5
     private var firstCacheLookupAt: Date?
     private var cacheLookupDeadline: Date?
     private var nextCacheRefreshAt: Date?
-    var preloadCacheDidChange: (() -> Void)?
+    var preloadCacheDidChange: (([PreloadCacheChange]) -> Void)?
 
     private enum FormatSource {
         case localFile
         case preloadCache
         case playbackLog
         case fallback
+    }
+
+    private struct AppliedPreloadPrediction {
+        let record: AppleMusicPreloadRecord
+        let previousTrackIdentity: String?
+        let previousQueueItemID: Int
+        let appliedAt: Date
+    }
+
+    private enum PlaybackTickStoreResult {
+        case accepted
+        case ignoredStale(expectedQueueItemID: Int)
+        case confirmedPredicted
     }
 
     func startLogStream() {
@@ -1177,6 +1769,137 @@ final class AppleMusicMonitor {
 
     func currentOutput() -> AudioOutputSnapshot {
         outputReader.currentOutput()
+    }
+
+    func outputSwitchSuppressionFields(for state: AppState, now: Date = Date()) -> String? {
+        guard let predictionTransitionGuard else {
+            return nil
+        }
+
+        let stateQueueItemID = state.currentPlaybackQueueItemID ?? state.currentPreloadRecord?.queueItemID
+        guard let stateQueueItemID else {
+            return nil
+        }
+
+        switch predictionTransitionGuard.evaluate(queueItemID: stateQueueItemID, now: now) {
+        case .ignoredStale(let expectedQueueItemID):
+            return "reason=transition-guard stateQ=\(stateQueueItemID) expected=\(expectedQueueItemID) stateFormat=\(debugCompactFormat(state.format)) predictedFormat=\(debugCompactFormat(predictionTransitionGuard.predictedFormat))"
+
+        case .expired:
+            self.predictionTransitionGuard = nil
+            loggedStaleTransitionQueueItemIDs.removeAll()
+            return nil
+
+        case .miss:
+            self.predictionTransitionGuard = nil
+            loggedStaleTransitionQueueItemIDs.removeAll()
+            return nil
+
+        case .accepted, .confirmedPredicted:
+            return nil
+        }
+    }
+
+    func rememberAppliedPrediction(
+        _ record: AppleMusicPreloadRecord,
+        previousTrackIdentity: String?,
+        previousQueueItemID: Int
+    ) {
+        let now = Date()
+        appliedPreloadPrediction = AppliedPreloadPrediction(
+            record: record,
+            previousTrackIdentity: previousTrackIdentity,
+            previousQueueItemID: previousQueueItemID,
+            appliedAt: now
+        )
+        predictionTransitionGuard = PreloadPredictionTransitionGuard(
+            previousQueueItemID: previousQueueItemID,
+            predictedQueueItemID: record.queueItemID,
+            predictedFormat: record.format,
+            appliedAt: now,
+            expiresAt: now.addingTimeInterval(stalePlaybackTickProtectionWindow)
+        )
+        loggedStaleTransitionQueueItemIDs.removeAll()
+    }
+
+    func predictionState() -> PreloadPredictionState {
+        guard isAppleMusicRunning else {
+            return PreloadPredictionState(playbackState: .notRunning)
+        }
+
+        let track = currentTrack()
+        if !track.isStopped,
+           track.identity == currentTrackIdentity {
+            currentTrackAppleScriptSampleRate = track.sampleRate ?? currentTrackAppleScriptSampleRate
+        }
+
+        let record = track.identity == currentTrackIdentity ? currentPreloadRecord : nil
+        return PreloadPredictionState(
+            trackIdentity: track.identity,
+            playbackState: track.playbackStatus.predictionPlaybackState,
+            duration: track.duration,
+            playerPosition: track.playerPosition,
+            currentQueueItemID: record?.queueItemID,
+            currentQueueSectionID: record?.queueSectionID,
+            currentRecord: record,
+            nextRecord: record.flatMap { nextPreloadRecord(after: $0) }
+        )
+    }
+
+    func eventPredictionState() -> PreloadPredictionState {
+        eventPredictionState(now: Date())
+    }
+
+    func eventPredictionState(now: Date) -> PreloadPredictionState {
+        guard isAppleMusicRunning else {
+            return PreloadPredictionState(playbackState: .notRunning)
+        }
+
+        let record = currentPreloadRecord
+            ?? currentPlaybackQueueItemID.flatMap { preloadCache.record(queueItemID: $0) }
+        let playbackTiming = estimatedPlaybackTiming(now: now)
+        let nextRecord = currentPlaybackQueueItemID.flatMap { queueItemID in
+            preloadCache.nextRecord(
+                afterQueueItemID: queueItemID,
+                queueSectionID: currentPlaybackQueueSectionID
+            )
+        } ?? record.flatMap { nextPreloadRecord(after: $0) }
+
+        return PreloadPredictionState(
+            trackIdentity: currentTrackIdentity,
+            playbackState: currentPlaybackQueueItemID == nil ? .unknown : .playing,
+            duration: playbackTiming?.duration,
+            playerPosition: playbackTiming?.playerPosition,
+            currentQueueItemID: currentPlaybackQueueItemID ?? record?.queueItemID,
+            currentQueueSectionID: currentPlaybackQueueSectionID ?? record?.queueSectionID,
+            currentRecord: record,
+            nextRecord: nextRecord
+        )
+    }
+
+    private func estimatedPlaybackTiming(now: Date) -> (duration: Double, playerPosition: Double)? {
+        guard let currentPlaybackPosition,
+              let currentPlaybackRemainingTime else {
+            return nil
+        }
+
+        let duration = currentPlaybackPosition + currentPlaybackRemainingTime
+        guard duration.isFinite,
+              duration > 0 else {
+            return nil
+        }
+
+        let elapsed = currentPlaybackUpdatedAt.map { max(0, now.timeIntervalSince($0)) } ?? 0
+        return (duration, min(currentPlaybackPosition + elapsed, duration))
+    }
+
+    private func nextPreloadRecord(after record: AppleMusicPreloadRecord) -> AppleMusicPreloadRecord? {
+        preloadCache.nextRecord(
+            afterQueueItemID: record.queueItemID,
+            queueSectionID: currentPlaybackQueueItemID == record.queueItemID
+                ? currentPlaybackQueueSectionID ?? record.queueSectionID
+                : record.queueSectionID
+        )
     }
 
     func snapshot(forceLogScan: Bool = false) -> AppState {
@@ -1200,13 +1923,20 @@ final class AppleMusicMonitor {
             debugLog("manual refresh requested: target title=\(Self.debugQuote(track.title)) durationInt=\(Self.debugDurationInt(track.duration))")
             beginDetection(for: track, now: now)
         } else if cachedStatus == .detecting {
-            advanceCacheLookupIfNeeded(for: track, now: now)
+            if resolveCurrentQueueFormatIfAvailable(merging: track.format) == nil {
+                advanceCacheLookupIfNeeded(for: track, now: now)
+            }
         } else if cachedStatus == .unverifiedLossless {
             rememberUnverifiedSampleRate(from: track)
         } else if cachedFormatSource == .playbackLog,
                   preloadCacheRevision != lastResolvedPreloadCacheRevision {
             refinePlaybackLogFormatFromPreloadCache(for: track)
         } else if cachedFormat != nil {
+            if cachedFormatSource == .preloadCache,
+               cachedFormat?.codec == "ALAC",
+               cachedFormat?.bitDepth != nil {
+                return makeState(for: track, format: cachedFormat, status: cachedStatus, now: now)
+            }
             cachedFormat = cachedFormat?.preservingBitDepth(from: track.format) ?? track.format
         }
 
@@ -1221,6 +1951,15 @@ final class AppleMusicMonitor {
         currentTrackIdentity = nil
         currentTrackDetectionStartedAt = nil
         currentTrackAppleScriptSampleRate = nil
+        currentPreloadRecord = nil
+        currentPlaybackQueueItemID = nil
+        currentPlaybackQueueSectionID = nil
+        currentPlaybackPosition = nil
+        currentPlaybackRemainingTime = nil
+        currentPlaybackUpdatedAt = nil
+        predictionTransitionGuard = nil
+        loggedStaleTransitionQueueItemIDs.removeAll()
+        appliedPreloadPrediction = nil
         clearCacheLookupSchedule()
     }
 
@@ -1250,6 +1989,13 @@ final class AppleMusicMonitor {
             albumName: track.album,
             outputSampleRate: output.sampleRate,
             outputBitDepth: output.bitDepth,
+            appleScriptSampleRate: track.sampleRate ?? currentTrackAppleScriptSampleRate,
+            trackDuration: track.duration,
+            playerPosition: track.playerPosition,
+            currentPlaybackQueueItemID: currentPlaybackQueueItemID,
+            currentPlaybackQueueSectionID: currentPlaybackQueueSectionID,
+            currentPreloadRecord: currentPreloadRecord,
+            nextPreloadRecord: currentPreloadRecord.flatMap { nextPreloadRecord(after: $0) },
             refreshAfter: cacheRefreshDelay(now: now),
             unverifiedSampleRate: resolvedUnverifiedSampleRate
         )
@@ -1404,9 +2150,18 @@ final class AppleMusicMonitor {
     }
 
     private func beginDetection(for track: TrackSnapshot, now: Date) {
+        let previousTrackIdentity = currentTrackIdentity
         currentTrackIdentity = track.identity
         currentTrackDetectionStartedAt = now
         currentTrackAppleScriptSampleRate = track.sampleRate
+        currentPreloadRecord = nil
+        currentPlaybackQueueItemID = nil
+        currentPlaybackQueueSectionID = nil
+        currentPlaybackPosition = nil
+        currentPlaybackRemainingTime = nil
+        currentPlaybackUpdatedAt = nil
+        predictionTransitionGuard = nil
+        loggedStaleTransitionQueueItemIDs.removeAll()
         cachedUnverifiedSampleRate = nil
         cachedFormatSource = nil
 
@@ -1428,7 +2183,73 @@ final class AppleMusicMonitor {
             debugLog("format: local file location unavailable kind=\(Self.debugQuote(track.kind)) title=\(Self.debugQuote(track.title)); falling back to preload cache")
         }
 
+        if adoptAppliedPredictionIfEligible(for: track, previousTrackIdentity: previousTrackIdentity, now: now) {
+            return
+        }
+
         beginCacheLookup(for: track, now: now)
+    }
+
+    private func adoptAppliedPredictionIfEligible(
+        for track: TrackSnapshot,
+        previousTrackIdentity: String?,
+        now: Date
+    ) -> Bool {
+        guard let prediction = appliedPreloadPrediction else {
+            return false
+        }
+
+        guard now.timeIntervalSince(prediction.appliedAt) <= appliedPredictionAdoptionWindow else {
+            appliedPreloadPrediction = nil
+            return false
+        }
+
+        if let expectedPreviousIdentity = prediction.previousTrackIdentity,
+           expectedPreviousIdentity != previousTrackIdentity {
+            appliedPreloadPrediction = nil
+            return false
+        }
+
+        let observedSampleRate = track.sampleRate ?? currentTrackAppleScriptSampleRate
+        guard let predictedSampleRate = prediction.record.format.sampleRate,
+              let observedSampleRate,
+              abs(predictedSampleRate - observedSampleRate) < 0.5 else {
+            debugLog("format: predicted preload adoption skipped reason=sample-rate-mismatch queueItemID=\(prediction.record.queueItemID) predicted=\(Self.debugOptional(prediction.record.format.sampleRate)) observed=\(Self.debugOptional(observedSampleRate))")
+            appliedPreloadPrediction = nil
+            return false
+        }
+
+        let resolvedFormat = track.format?.merging(prediction.record.format) ?? prediction.record.format
+        guard resolvedFormat.isReadyForDisplay else {
+            appliedPreloadPrediction = nil
+            return false
+        }
+
+        cachedFormat = resolvedFormat
+        cachedStatus = .detected
+        cachedFormatSource = .preloadCache
+        cachedUnverifiedSampleRate = nil
+        currentPreloadRecord = prediction.record
+        currentPlaybackQueueItemID = prediction.record.queueItemID
+        currentPlaybackQueueSectionID = prediction.record.queueSectionID
+        if let duration = track.duration,
+           let playerPosition = track.playerPosition {
+            currentPlaybackPosition = playerPosition
+            currentPlaybackRemainingTime = max(0, duration - playerPosition)
+            currentPlaybackUpdatedAt = now
+        }
+        predictionTransitionGuard = PreloadPredictionTransitionGuard(
+            previousQueueItemID: prediction.previousQueueItemID,
+            predictedQueueItemID: prediction.record.queueItemID,
+            predictedFormat: prediction.record.format,
+            appliedAt: prediction.appliedAt,
+            expiresAt: now.addingTimeInterval(stalePlaybackTickProtectionWindow)
+        )
+        loggedStaleTransitionQueueItemIDs.removeAll()
+        appliedPreloadPrediction = nil
+        clearCacheLookupSchedule()
+        debugLog("format.adopt action=predicted q=\(prediction.record.queueItemID) section=\(Self.debugOptional(prediction.record.queueSectionID)) group=\(prediction.record.groupID) format=\(debugCompactFormat(Optional(resolvedFormat))) previous=\(prediction.previousQueueItemID)")
+        return true
     }
 
     private func beginCacheLookup(for track: TrackSnapshot, now: Date) {
@@ -1436,12 +2257,17 @@ final class AppleMusicMonitor {
         cachedStatus = .detecting
         cachedFormatSource = nil
         cachedUnverifiedSampleRate = nil
+        currentPreloadRecord = nil
         currentTrackIdentity = track.identity
         currentTrackAppleScriptSampleRate = track.sampleRate ?? currentTrackAppleScriptSampleRate
         firstCacheLookupAt = now.addingTimeInterval(initialCacheLookupDelay)
         cacheLookupDeadline = now.addingTimeInterval(cacheLookupWaitLimit)
         nextCacheRefreshAt = firstCacheLookupAt
         debugLog("cache lookup scheduled: initialDelay=\(initialCacheLookupDelay)s deadline=\(debugTime(cacheLookupDeadline)) target title=\(Self.debugQuote(track.title)) durationInt=\(Self.debugDurationInt(track.duration))")
+
+        if case .found = preloadCache.lookup(title: track.title, duration: track.duration) {
+            resolveFormatFromPreloadCache(for: track, now: now)
+        }
     }
 
     private func advanceCacheLookupIfNeeded(for track: TrackSnapshot, now: Date) {
@@ -1461,7 +2287,7 @@ final class AppleMusicMonitor {
 
     private func resolveFormatFromPreloadCache(for track: TrackSnapshot, now: Date) {
         lastResolvedPreloadCacheRevision = preloadCacheRevision
-        debugLog("cache lookup: target title=\(Self.debugQuote(track.title)) durationInt=\(Self.debugDurationInt(track.duration)) kind=\(Self.debugQuote(track.kind)) cached=\(preloadCache.count)")
+        debugLog("cache lookup: target title=\(Self.debugQuote(track.title)) durationInt=\(Self.debugDurationInt(track.duration)) kind=\(Self.debugQuote(track.kind)) cached=\(preloadCache.count) cacheIDs=\(debugPreloadCacheIDs()) metadataIDs=\(debugPreloadMetadataIDs())")
 
         switch preloadCache.lookup(title: track.title, duration: track.duration) {
         case .found(let record):
@@ -1471,8 +2297,9 @@ final class AppleMusicMonitor {
                 cachedStatus = .detected
                 cachedFormatSource = .preloadCache
                 cachedUnverifiedSampleRate = nil
+                currentPreloadRecord = record
                 clearCacheLookupSchedule()
-                debugLog("format: found queueItemID=\(record.queueItemID) group=\(record.groupID) \(debugFormat(resolvedFormat))")
+                debugLog("format.resolve action=metadata-match q=\(record.queueItemID) group=\(record.groupID) format=\(debugCompactFormat(Optional(resolvedFormat)))")
             } else {
                 resolveNonAlacFallback(from: track)
                 clearCacheLookupSchedule()
@@ -1488,6 +2315,7 @@ final class AppleMusicMonitor {
     }
 
     private func resolveNonAlacFallback(from track: TrackSnapshot) {
+        currentPreloadRecord = nil
         if let aacFormat = fallbackAACFormat(from: track) {
             cachedFormat = aacFormat
             cachedStatus = .detected
@@ -1512,6 +2340,7 @@ final class AppleMusicMonitor {
                 cachedStatus = .failed
                 cachedFormatSource = nil
                 cachedUnverifiedSampleRate = nil
+                currentPreloadRecord = nil
                 clearCacheLookupSchedule()
                 debugLog("format: preload cache empty after wait; failed without AAC fallback")
                 return
@@ -1534,6 +2363,7 @@ final class AppleMusicMonitor {
         cachedStatus = .detecting
         cachedFormatSource = nil
         cachedUnverifiedSampleRate = nil
+        currentPreloadRecord = nil
         nextCacheRefreshAt = min(now.addingTimeInterval(emptyCacheRetryInterval), cacheLookupDeadline)
         debugLog("format: preload cache miss reason=\(reason); waiting for cache until \(debugTime(cacheLookupDeadline))")
     }
@@ -1554,12 +2384,35 @@ final class AppleMusicMonitor {
     }
 
     private func rememberPreloadLogEntries(_ entries: [AppleMusicLogStream.Entry]) {
-        var didChangeCache = false
-        var didChangePlaybackFormat = false
+        var changes: [PreloadCacheChange] = []
 
         for entry in entries {
+            if let snapshot = parser.parseQueueSnapshot(entry.message) {
+                if let change = rememberQueueSnapshot(snapshot) {
+                    changes.append(change)
+                }
+            } else if let link = parser.parseAssetQueueLink(entry.message),
+               rememberQueueLink(link) {
+                changes.append(.queueLink(link))
+            }
+
+            if let tick = parser.parsePlaybackItemTick(entry.message) {
+                switch rememberPlaybackTick(tick) {
+                case .accepted, .confirmedPredicted:
+                    changes.append(.playbackTick(tick))
+                    if let record = resolveCurrentQueueFormatIfAvailable() {
+                        changes.append(.currentQueueFormatResolved(record))
+                    }
+
+                case .ignoredStale:
+                    break
+                }
+            }
+
             if parser.parsePlaybackFormat(entry.message)?.codec == "ALAC" {
-                didChangePlaybackFormat = promotePlaybackLosslessIfEligible(from: entry) || didChangePlaybackFormat
+                if promotePlaybackLosslessIfEligible(from: entry) {
+                    changes.append(.playbackFormatPromoted)
+                }
             }
 
             let completedRecords = preloadAssembler.ingest(
@@ -1569,13 +2422,173 @@ final class AppleMusicMonitor {
             )
 
             for record in completedRecords {
-                didChangeCache = rememberCompletedPreloadRecord(record) || didChangeCache
+                if let change = rememberCompletedPreloadRecord(record) {
+                    changes.append(change)
+                }
+                if record.queueItemID == currentPlaybackQueueItemID,
+                   let resolvedRecord = resolveCurrentQueueFormatIfAvailable() {
+                    changes.append(.currentQueueFormatResolved(resolvedRecord))
+                }
             }
         }
 
-        if didChangeCache || didChangePlaybackFormat {
-            preloadCacheDidChange?()
+        if !changes.isEmpty {
+            preloadCacheDidChange?(changes)
         }
+    }
+
+    private func rememberQueueSnapshot(_ snapshot: AppleMusicQueueSnapshot) -> PreloadCacheChange? {
+        let result = preloadCache.rememberQueueSnapshot(snapshot)
+        guard !result.changedLinks.isEmpty else {
+            return nil
+        }
+
+        debugLog("preload.snapshot source=\(snapshot.source.logDescription) section=\(debugQueueSnapshotSection(snapshot)) items=\(debugQueueSnapshotItems(snapshot))")
+        for reorder in result.reorders {
+            debugLog("preload.reorder source=\(reorder.source.logDescription) section=\(reorder.queueSectionID) current=\(reorder.currentQueueItemID) oldNext=\(reorder.oldNextQueueItemID) newNext=\(reorder.newNextQueueItemID)")
+        }
+
+        return .queueSnapshot(result)
+    }
+
+    @discardableResult
+    private func rememberQueueLink(_ link: AppleMusicAssetQueueLink) -> Bool {
+        guard preloadCache.rememberNext(link) else {
+            return false
+        }
+
+        debugLog("preload.link section=\(link.queueSectionID) prior=\(link.priorQueueItemID) next=\(link.nextQueueItemID)")
+        return true
+    }
+
+    private func rememberPlaybackTick(_ tick: AppleMusicPlaybackItemTick) -> PlaybackTickStoreResult {
+        let now = Date()
+
+        if let predictionTransitionGuard {
+            switch predictionTransitionGuard.evaluate(queueItemID: tick.queueItemID, now: now) {
+            case .ignoredStale(let expectedQueueItemID):
+                if loggedStaleTransitionQueueItemIDs.insert(tick.queueItemID).inserted {
+                    debugLog(
+                        "playback.tick action=ignored reason=stale-after-prediction q=\(tick.queueItemID) expected=\(expectedQueueItemID) section=\(tick.queueSectionID) position=\(debugSeconds(tick.position)) remaining=\(debugSeconds(tick.remainingTime))"
+                    )
+                }
+                return .ignoredStale(expectedQueueItemID: expectedQueueItemID)
+
+            case .confirmedPredicted:
+                acceptPlaybackTick(tick, now: now, action: "confirmed", extra: nil)
+                return .confirmedPredicted
+
+            case .miss:
+                let previous = predictionTransitionGuard.previousQueueItemID
+                let predicted = predictionTransitionGuard.predictedQueueItemID
+                self.predictionTransitionGuard = nil
+                loggedStaleTransitionQueueItemIDs.removeAll()
+                acceptPlaybackTick(
+                    tick,
+                    now: now,
+                    action: "accepted",
+                    extra: " reason=transition-miss previous=\(previous) predicted=\(predicted)"
+                )
+                return .accepted
+
+            case .expired:
+                self.predictionTransitionGuard = nil
+                loggedStaleTransitionQueueItemIDs.removeAll()
+                acceptPlaybackTick(tick, now: now, action: "accepted", extra: " reason=guard-expired")
+                return .accepted
+
+            case .accepted:
+                break
+            }
+        }
+
+        acceptPlaybackTick(tick, now: now, action: "accepted", extra: nil)
+        return .accepted
+    }
+
+    private func acceptPlaybackTick(
+        _ tick: AppleMusicPlaybackItemTick,
+        now: Date,
+        action: String,
+        extra: String?
+    ) {
+        currentPlaybackQueueItemID = tick.queueItemID
+        currentPlaybackQueueSectionID = tick.queueSectionID
+        currentPlaybackPosition = tick.position
+        currentPlaybackRemainingTime = tick.remainingTime
+        currentPlaybackUpdatedAt = now
+        debugLog(
+            "playback.tick action=\(action) q=\(tick.queueItemID) section=\(tick.queueSectionID) position=\(debugSeconds(tick.position)) remaining=\(debugSeconds(tick.remainingTime)) \(debugPredictionStatus(for: tick))\(extra ?? "")"
+        )
+    }
+
+    private func debugPredictionStatus(for tick: AppleMusicPlaybackItemTick) -> String {
+        let currentRecord = currentPreloadRecord?.queueItemID == tick.queueItemID
+            ? currentPreloadRecord
+            : preloadCache.record(queueItemID: tick.queueItemID)
+
+        guard let nextRecord = preloadCache.nextRecord(
+            afterQueueItemID: tick.queueItemID,
+            queueSectionID: tick.queueSectionID
+        ) else {
+            return "prediction=waiting-next"
+        }
+
+        if let currentRecord,
+           currentRecord.format.sampleRate == nextRecord.format.sampleRate,
+           currentRecord.format.bitDepth == nextRecord.format.bitDepth {
+            return "prediction=matching-format next=\(nextRecord.queueItemID)"
+        }
+
+        let applyIn = tick.remainingTime <= 3.5 ? 0 : max(tick.remainingTime - 3.0, 0)
+        let currentFormatStatus = currentRecord == nil ? " current-format=unknown" : ""
+        return "prediction=armed next=\(nextRecord.queueItemID) format=\(debugCompactFormat(nextRecord.format)) applyIn=\(debugSeconds(applyIn))\(currentFormatStatus)"
+    }
+
+    private func debugQueueSnapshotItems(_ snapshot: AppleMusicQueueSnapshot) -> String {
+        let items = snapshot.items
+            .map { String($0.queueItemID) }
+            .joined(separator: ",")
+        return "[\(items)]"
+    }
+
+    private func debugQueueSnapshotSection(_ snapshot: AppleMusicQueueSnapshot) -> String {
+        let sectionIDs = Set(snapshot.items.map(\.queueSectionID))
+        guard sectionIDs.count == 1,
+              let sectionID = sectionIDs.first else {
+            return "mixed"
+        }
+
+        return String(sectionID)
+    }
+
+    private func resolveCurrentQueueFormatIfAvailable(merging trackFormat: AudioFormat? = nil) -> AppleMusicPreloadRecord? {
+        guard let queueItemID = currentPlaybackQueueItemID,
+              let record = preloadCache.record(queueItemID: queueItemID) else {
+            return nil
+        }
+
+        let resolvedFormat = trackFormat?.merging(record.format)
+            ?? cachedFormat?.merging(record.format)
+            ?? record.format
+        guard resolvedFormat.isReadyForDisplay else {
+            return nil
+        }
+
+        guard currentPreloadRecord?.queueItemID != record.queueItemID
+            || cachedFormat != resolvedFormat
+            || cachedFormatSource != .preloadCache else {
+            return nil
+        }
+
+        cachedFormat = resolvedFormat
+        cachedStatus = .detected
+        cachedFormatSource = .preloadCache
+        cachedUnverifiedSampleRate = nil
+        currentPreloadRecord = record
+        clearCacheLookupSchedule()
+        debugLog("format.resolve action=current q=\(record.queueItemID) group=\(record.groupID) format=\(debugCompactFormat(Optional(resolvedFormat)))")
+        return record
     }
 
     @discardableResult
@@ -1627,6 +2640,7 @@ final class AppleMusicMonitor {
         cachedStatus = .detected
         cachedFormatSource = .playbackLog
         cachedUnverifiedSampleRate = nil
+        currentPreloadRecord = nil
         currentTrackAppleScriptSampleRate = sampleRate
         clearCacheLookupSchedule()
         debugLog("format: playback lossless promoted elapsed=\(elapsed)s window=\(playbackLosslessPromotionWindow)s tolerance=\(playbackLosslessPromotionDeliveryTolerance)s sampleRate=\(sampleRate)")
@@ -1650,19 +2664,48 @@ final class AppleMusicMonitor {
         cachedStatus = .detected
         cachedFormatSource = .preloadCache
         cachedUnverifiedSampleRate = nil
+        currentPreloadRecord = record
         debugLog("format: playback lossless refined from preload cache queueItemID=\(record.queueItemID) group=\(record.groupID) \(debugFormat(resolvedFormat))")
     }
 
     @discardableResult
-    private func rememberCompletedPreloadRecord(_ record: AppleMusicPreloadRecord) -> Bool {
-        let existingRecord = preloadCache.store(record)
-        guard existingRecord != record else {
-            return false
+    private func rememberCompletedPreloadRecord(_ record: AppleMusicPreloadRecord) -> PreloadCacheChange? {
+        let result = preloadCache.store(record)
+        let previousRecord: AppleMusicPreloadRecord?
+        let storedRecord: AppleMusicPreloadRecord
+
+        switch result {
+        case .inserted(let current):
+            previousRecord = nil
+            storedRecord = current
+
+        case .updated(let previous, let current):
+            previousRecord = previous
+            storedRecord = current
+
+        case .unchanged:
+            return nil
         }
 
         preloadCacheRevision += 1
-        debugLog("preload: saved completed format queueItemID=\(record.queueItemID) title=\(Self.debugQuote(record.title)) group=\(record.groupID) parsed=\(debugFormat(record.format))")
-        return true
+        if previousRecord?.hasMetadata == false && storedRecord.hasMetadata {
+            debugLog("preload.metadata action=enriched q=\(storedRecord.queueItemID) title=\(Self.debugQuote(storedRecord.title)) durationInt=\(Self.debugDurationInt(storedRecord.duration))")
+            return .enrichedMetadata(storedRecord)
+        } else if storedRecord.hasMetadata {
+            if let previousRecord {
+                debugLog("preload.format action=updated-completed q=\(storedRecord.queueItemID) section=\(Self.debugOptional(storedRecord.queueSectionID)) title=\(Self.debugQuote(storedRecord.title)) oldGroup=\(previousRecord.groupID) oldFormat=\(debugCompactFormat(Optional(previousRecord.format))) newGroup=\(storedRecord.groupID) newFormat=\(debugCompactFormat(Optional(storedRecord.format)))")
+            } else {
+                debugLog("preload.format action=saved-completed q=\(storedRecord.queueItemID) section=\(Self.debugOptional(storedRecord.queueSectionID)) title=\(Self.debugQuote(storedRecord.title)) group=\(storedRecord.groupID) format=\(debugCompactFormat(Optional(storedRecord.format)))")
+            }
+            return .savedCompleted(storedRecord)
+        } else {
+            if let previousRecord {
+                debugLog("preload.format action=updated q=\(storedRecord.queueItemID) section=\(Self.debugOptional(storedRecord.queueSectionID)) oldGroup=\(previousRecord.groupID) oldFormat=\(debugCompactFormat(Optional(previousRecord.format))) newGroup=\(storedRecord.groupID) newFormat=\(debugCompactFormat(Optional(storedRecord.format)))")
+            } else {
+                debugLog("preload.format action=saved q=\(storedRecord.queueItemID) section=\(Self.debugOptional(storedRecord.queueSectionID)) group=\(storedRecord.groupID) format=\(debugCompactFormat(Optional(storedRecord.format)))")
+            }
+            return .savedFormatOnly(storedRecord)
+        }
     }
 
     private struct TrackSnapshot {
@@ -1765,16 +2808,26 @@ final class AppleMusicMonitor {
         }
 
         let titleMatches = title.map { targetTitle in
-            candidates.filter { titlesMatch($0.title, targetTitle) }
+            candidates.filter { candidate in
+                candidate.title.map { titlesMatch($0, targetTitle) } ?? false
+            }
         } ?? []
         let durationMatches = duration.map { targetDuration in
-            candidates.filter { durationsMatch($0.duration, targetDuration) }
+            candidates.filter { candidate in
+                candidate.duration.map { durationsMatch($0, targetDuration) } ?? false
+            }
         } ?? []
         let titleOnlyMatches = titleMatches.filter { candidate in
-            duration.map { !durationsMatch(candidate.duration, $0) } ?? true
+            guard let candidateDuration = candidate.duration else {
+                return true
+            }
+            return duration.map { !durationsMatch(candidateDuration, $0) } ?? true
         }
         let durationOnlyMatches = durationMatches.filter { candidate in
-            title.map { !titlesMatch(candidate.title, $0) } ?? true
+            guard let candidateTitle = candidate.title else {
+                return true
+            }
+            return title.map { !titlesMatch(candidateTitle, $0) } ?? true
         }
 
         debugLog(
@@ -1797,8 +2850,27 @@ final class AppleMusicMonitor {
     private func debugPreloadCandidates(_ candidates: [AppleMusicPreloadRecord]) -> String {
         candidates
             .prefix(5)
-            .map { "id=\($0.queueItemID) title=\(Self.debugQuote($0.title)) durationInt=\(integerSeconds($0.duration)) group=\($0.groupID) rawDuration=\($0.duration)" }
+            .map { "id=\($0.queueItemID) title=\(Self.debugQuote($0.title)) durationInt=\(Self.debugDurationInt($0.duration)) group=\($0.groupID) rawDuration=\(Self.debugOptional($0.duration))" }
             .joined(separator: " | ")
+    }
+
+    private func debugPreloadCacheIDs() -> String {
+        let ids = preloadCache.records
+            .map(\.queueItemID)
+            .sorted()
+            .map(String.init)
+            .joined(separator: ",")
+        return "[\(ids)]"
+    }
+
+    private func debugPreloadMetadataIDs() -> String {
+        let ids = preloadCache.records
+            .filter(\.hasMetadata)
+            .map(\.queueItemID)
+            .sorted()
+            .map(String.init)
+            .joined(separator: ",")
+        return "[\(ids)]"
     }
 
     private func debugFormat(_ format: AudioFormat?) -> String {
@@ -1807,6 +2879,21 @@ final class AppleMusicMonitor {
         }
 
         return "codec=\(Self.debugOptional(format.codec)) bitDepth=\(Self.debugOptional(format.bitDepth)) bitRate=\(Self.debugOptional(format.bitRate)) sampleRate=\(Self.debugOptional(format.sampleRate))"
+    }
+
+    private func debugCompactFormat(_ format: AudioFormat) -> String {
+        let sampleRate = format.sampleRate.map { String(Int($0.rounded())) } ?? "unknown"
+        let bitDepth = format.bitDepth.map(String.init) ?? "-"
+        return "\(sampleRate)/\(bitDepth)"
+    }
+
+    private func debugCompactFormat(_ format: AudioFormat?) -> String {
+        guard let format else {
+            return "unknown/-"
+        }
+
+        let codec = format.codec ?? "unknown"
+        return "\(codec)/\(debugCompactFormat(format))"
     }
 
     private var cachedStatusDescription: String {
@@ -1819,6 +2906,10 @@ final class AppleMusicMonitor {
         }
 
         return date.formatted(date: .omitted, time: .standard)
+    }
+
+    private func debugSeconds(_ value: Double) -> String {
+        String(format: "%.3f", value)
     }
 
     private static func debugQuote(_ value: String?) -> String {
@@ -2022,7 +3113,7 @@ private final class AppleMusicLogStream: @unchecked Sendable {
     }
 
     private static let predicate = """
-    process == "Music" AND (subsystem == "com.apple.amp.mediaplaybackcore" OR eventMessage CONTAINS[c] "item-begin" OR eventMessage CONTAINS[c] "audio-format-changed" OR eventMessage CONTAINS[c] "PlaybackEventStream" OR eventMessage CONTAINS[c] "Engagement" OR eventMessage CONTAINS[c] "PBAudioFormat" OR eventMessage CONTAINS[c] "Audio format changed")
+    process == "Music" AND (subsystem == "com.apple.amp.mediaplaybackcore" OR eventMessage CONTAINS[c] "item-begin" OR eventMessage CONTAINS[c] "ITEM TICK" OR eventMessage CONTAINS[c] "ASSET QUEUE" OR eventMessage CONTAINS[c] "Queue->Player synchronization completed" OR eventMessage CONTAINS[c] "playerItems:" OR eventMessage CONTAINS[c] "loadedQueueItems:" OR eventMessage CONTAINS[c] "QUEUE EVENT PROCESSED" OR eventMessage CONTAINS[c] "synchronizeQueueItemsToPlayer" OR eventMessage CONTAINS[c] "prior item" OR eventMessage CONTAINS[c] "audio-format-changed" OR eventMessage CONTAINS[c] "PlaybackEventStream" OR eventMessage CONTAINS[c] "Engagement" OR eventMessage CONTAINS[c] "PBAudioFormat" OR eventMessage CONTAINS[c] "Audio format changed")
     """
 }
 

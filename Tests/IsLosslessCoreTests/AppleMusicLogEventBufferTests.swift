@@ -134,4 +134,25 @@ struct AppleMusicLogEventBufferTests {
         #expect(dateComponents.minute == 35)
         #expect(dateComponents.second == 1)
     }
+
+    @Test func flushesPlaybackEventsQueueSignals() {
+        var buffer = AppleMusicLogEventBuffer()
+        let events = buffer.ingest(
+            """
+            2026-06-20 19:46:14.128 Df Music[80355:1d3532] [com.apple.amp.mediaplaybackcore:PlaybackEvents] ITEM TICK                  8502 8582                   ║ 2:38.48 ━━━━━━━━━━━━━━━━━━━━━━━━━●━━━ -0:20.51
+            2026-06-20 19:43:34.989 Df Music[80355:160ef2] [com.apple.amp.mediaplaybackcore:Playback] ASSET QUEUE                  Suspending asset task at 'loadItem' for 8502::8584 [prior item 8502::8582 not finished] [IT-8501]
+            2026-06-20 20:59:49.446 Df Music[80355:160ef2] [com.apple.amp.mediaplaybackcore:Playback] QUEUE EVENT PROCESSED   〔PlayingState〕- CoordinatorEvent.synchronizeQueueItemsToPlayer - items:[<ITMPAVItem: 0xbc9616300> (8881+9094::9096) romeo n juliet (feat. 유라), <ITMPAVItem: 0xbc8fda300> (8881+9103::9105) I Really Want to Stay At Your House] hasLoadedAllItems:false
+            2026-06-20 21:16:21.774 Df Music[80355:160ef2] [com.apple.amp.mediaplaybackcore:Playback] Queue->Player synchronization completed - playerItems:[<AVPlayerItem: 0xbcc5a3cc0> I/HBN [8881::8929] <ITMPAVItem: 0xbca39c700> (8881::8929) 가질 수 없는 너], <AVPlayerItem: 0xbcc494d70> I/IBB [8881+9139::9141] <ITMPAVItem: 0xbcab4dc00> (8881+9139::9141) 보라빛 밤]]
+            2026-06-20 21:16:22.349 Df Music[80355:160ef2] [com.apple.amp.mediaplaybackcore:Playback] ASSET QUEUE State: AssetQueueState(currentQueueItem: Optional(<ITMPAVItem: 0xbca39c700> (8881::8929) 가질 수 없는 너), loadedQueueItems: [<ITMPAVItem: 0xbca39c700> (8881::8929) 가질 수 없는 너, <ITMPAVItem: 0xbcbf1c380> (8881+9147::9149) Into the I-Land], unskippableError: nil)
+
+            """
+        )
+
+        #expect(events.count == 5)
+        #expect(parser.parsePlaybackItemTick(events[0].message)?.queueItemID == 8582)
+        #expect(parser.parseAssetQueueLink(events[1].message)?.nextQueueItemID == 8584)
+        #expect(parser.parseQueueItemsSnapshotLinks(events[2].message).first?.priorQueueItemID == 9096)
+        #expect(parser.parseQueueSnapshot(events[3].message)?.source == .playerQueue)
+        #expect(parser.parseQueueSnapshot(events[4].message)?.source == .assetQueueState)
+    }
 }
