@@ -5,20 +5,25 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="isLossless"
 PRODUCT_NAME="isLossless"
 DIST_DIR="$ROOT_DIR/dist"
-APP_DIR="$DIST_DIR/$APP_NAME.app"
-DMG_DIR="$DIST_DIR/dmg-root"
-DMG_PATH="$DIST_DIR/$APP_NAME.dmg"
+APP_VERSION="${APP_VERSION:-1.0}"
+BUILD_VERSION="${BUILD_VERSION:-$APP_VERSION}"
+DMG_NAME="${DMG_NAME:-$APP_NAME-$APP_VERSION}"
+DMG_PATH="$DIST_DIR/$DMG_NAME.dmg"
+PACKAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/isLossless-package.XXXXXX")"
+trap 'rm -rf "$PACKAGE_ROOT"' EXIT
+APP_DIR="$PACKAGE_ROOT/$APP_NAME.app"
+DMG_DIR="$PACKAGE_ROOT/dmg-root"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
-ICONSET_DIR="$DIST_DIR/AppIcon.iconset"
+ICONSET_DIR="$PACKAGE_ROOT/AppIcon.iconset"
 ICON_NAME="AppIcon"
 ICON_SOURCE="$ROOT_DIR/Assets/isLosslessapp.png"
 
 cd "$ROOT_DIR"
 swift build -c release --product "$PRODUCT_NAME"
 
-rm -rf "$APP_DIR" "$ICONSET_DIR"
+mkdir -p "$DIST_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$ICONSET_DIR"
 
 cp ".build/release/$PRODUCT_NAME" "$MACOS_DIR/$PRODUCT_NAME"
@@ -51,9 +56,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>$APP_VERSION</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>$BUILD_VERSION</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
@@ -83,8 +88,6 @@ rm -rf "$DMG_DIR"
 mkdir -p "$DMG_DIR"
 cp -R "$APP_DIR" "$DMG_DIR/"
 ln -s /Applications "$DMG_DIR/Applications"
-hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG_PATH" >/dev/null
-rm -rf "$DMG_DIR"
+hdiutil create -volname "$APP_NAME $APP_VERSION" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG_PATH" >/dev/null
 
-echo "$APP_DIR"
 echo "$DMG_PATH"
