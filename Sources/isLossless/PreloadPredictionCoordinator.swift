@@ -107,6 +107,13 @@ final class PreloadPredictionCoordinator {
         clearPending(logReason: reason)
     }
 
+    func reset(reason: String) {
+        clearPending(logReason: reason)
+        appliedPrediction = nil
+        confirmedPrediction = nil
+        lastMatchingFormatSkipKey = nil
+    }
+
     func cancelIfPendingReordered(_ result: AppleMusicQueueSnapshotStoreResult) {
         guard let pendingKey,
               let changedLink = result.changedLinks.first(where: {

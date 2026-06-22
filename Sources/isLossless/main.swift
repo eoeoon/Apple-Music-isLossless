@@ -22,6 +22,7 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let iconProvider = MenuBarIconProvider()
     private let monitor = AppleMusicMonitor()
     private var state = AppState(status: .detecting)
+    private static let automaticOutputPairingPreferenceKey = "automaticOutputPairingEnabled"
     private var menuLabels: [String: NSTextField] = [:]
     private var menuSlidingTextViews: [String: SlidingTextView] = [:]
     private var synchronizedSlidingGroups: [String: SynchronizedSlidingGroup] = [:]
@@ -33,6 +34,11 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pendingOutputRefreshWorkItem: DispatchWorkItem?
     private var pendingOutputSwitchSettlingWorkItem: DispatchWorkItem?
     private var isOutputSwitchSettling = false
+    private var pendingOutputTextFlash = false
+    private var pendingOutputTextFlashResetWorkItem: DispatchWorkItem?
+    private var outputTextFlashGeneration = 0
+    private var outputTextFlashOverlays: [NSTextField] = []
+    private var isAutomaticOutputPairingEnabled = true
     private let outputObserver = AudioOutputObserver()
     private let outputSwitchCoordinator = AutomaticOutputSwitchCoordinator()
     private let predictionCoordinator = PreloadPredictionCoordinator()
@@ -50,8 +56,9 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         static let headerFontSize: CGFloat = 14
         static let bodyFontSize: CGFloat = 13
         static let analysisIconTextGap: CGFloat = 6
-        static let formatOutputArrowWidth: CGFloat = 14
-        static let formatOutputArrowInset: CGFloat = 20
+        static let formatOutputToggleDiameter: CGFloat = 24
+        static let formatOutputToggleArrowWidth: CGFloat = 14
+        static let formatOutputToggleHorizontalGap: CGFloat = 6
 
         static var contentWidth: CGFloat {
             width - horizontalInset * 2
@@ -66,7 +73,7 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         static var formatOutputFormatColumnWidth: CGFloat {
-            max(0, analysisColumnWidth - formatOutputArrowInset)
+            max(0, analysisColumnWidth - formatOutputToggleDiameter)
         }
 
         static var slidingDetailTextWidth: CGFloat {
@@ -93,6 +100,7 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        isAutomaticOutputPairingEnabled = loadAutomaticOutputPairingPreference()
         monitor.preloadCacheDidChange = { [weak self] changes in
             self?.handlePreloadCacheChanges(changes)
         }
@@ -113,6 +121,8 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pendingCacheRefreshWorkItem?.cancel()
         pendingOutputRefreshWorkItem?.cancel()
         pendingOutputSwitchSettlingWorkItem?.cancel()
+        pendingOutputTextFlashResetWorkItem?.cancel()
+        clearOutputTextFlashOverlays()
         predictionCoordinator.cancel(reason: "app-terminating")
         monitor.stopLogStream()
         outputObserver.stop()
@@ -124,6 +134,35 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func manualRefresh() {
         refresh(forceLogScan: true)
+    }
+
+    private func loadAutomaticOutputPairingPreference() -> Bool {
+        guard UserDefaults.standard.object(forKey: Self.automaticOutputPairingPreferenceKey) != nil else {
+            return true
+        }
+
+        return UserDefaults.standard.bool(forKey: Self.automaticOutputPairingPreferenceKey)
+    }
+
+    private func setAutomaticOutputPairingEnabled(_ isEnabled: Bool, reason: String) {
+        let didChange = isAutomaticOutputPairingEnabled != isEnabled
+        isAutomaticOutputPairingEnabled = isEnabled
+        UserDefaults.standard.set(isEnabled, forKey: Self.automaticOutputPairingPreferenceKey)
+
+        if !isEnabled {
+            let resetReason = reason == "menu-toggle" ? "output-pairing-disabled" : reason
+            predictionCoordinator.reset(reason: resetReason)
+            monitor.clearAppliedPredictionState()
+            setOutputPredictionPending(false)
+            return
+        }
+
+        guard didChange else {
+            return
+        }
+
+        applyState(state)
+        applyEventPredictionIfPossible()
     }
 
     private func refresh(forceLogScan: Bool) {
@@ -215,19 +254,24 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let oldLayoutIdentity = state.menuLayoutIdentity
         state = newState
         predictionCoordinator.observeState(state.predictionState)
-        let outputSwitchSuppressionFields = monitor.outputSwitchSuppressionFields(for: state)
-        let shouldDeferOutputSwitch = outputSwitchSuppressionFields == nil
+        let outputSwitchSuppressionFields = isAutomaticOutputPairingEnabled
+            ? monitor.outputSwitchSuppressionFields(for: state)
+            : nil
+        let shouldDeferOutputSwitch = isAutomaticOutputPairingEnabled
+            && outputSwitchSuppressionFields == nil
             && predictionCoordinator.shouldDeferOutputSwitch(for: state.predictionState)
 
         if let suppressionFields = outputSwitchSuppressionFields {
             print("[isLossless] output.switch action=skipped \(suppressionFields)")
-        } else if !shouldDeferOutputSwitch {
+        } else if isAutomaticOutputPairingEnabled && !shouldDeferOutputSwitch {
             let result = outputSwitchCoordinator.applyIfNeeded(for: state)
             beginOutputSwitchSettlingIfNeeded(result)
             refreshOutputAfterSwitchIfNeeded(result)
         }
-        state.hasPendingOutputPrediction = predictionCoordinator.hasPendingPrediction
+        state.hasPendingOutputPrediction = isAutomaticOutputPairingEnabled
+            && predictionCoordinator.hasPendingPrediction
         state.hasMatchingOutputPrediction = !state.hasPendingOutputPrediction
+            && isAutomaticOutputPairingEnabled
             && isMatchingFormatPredictionAvailable(for: state.predictionState)
         state.isStatusMarkerTransitioning = outputSwitchSuppressionFields != nil
         scheduleCacheRefreshIfNeeded(after: newState.refreshAfter)
@@ -244,6 +288,11 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func applyEventPredictionIfPossible() {
+        guard isAutomaticOutputPairingEnabled else {
+            setOutputPredictionPending(false)
+            return
+        }
+
         let eventState = monitor.eventPredictionState()
         _ = predictionCoordinator.applyEventPrediction(
             for: eventState,
@@ -267,16 +316,18 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ isPending: Bool,
         predictionState: PreloadPredictionState? = nil
     ) {
-        let isMatching = !isPending
+        let effectiveIsPending = isAutomaticOutputPairingEnabled && isPending
+        let isMatching = isAutomaticOutputPairingEnabled
+            && !effectiveIsPending
             && isMatchingFormatPredictionAvailable(for: predictionState ?? state.predictionState)
-        guard state.hasPendingOutputPrediction != isPending
+        guard state.hasPendingOutputPrediction != effectiveIsPending
                 || state.hasMatchingOutputPrediction != isMatching else {
             updateOutputPredictionIndicator()
             updateMenuBarTitle()
             return
         }
 
-        state.hasPendingOutputPrediction = isPending
+        state.hasPendingOutputPrediction = effectiveIsPending
         state.hasMatchingOutputPrediction = isMatching
         updateOutputPredictionIndicator()
         updateMenuBarTitle()
@@ -298,6 +349,10 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         trackIdentity: String?,
         previousQueueItemID: Int
     ) -> AudioOutputSwitchResult? {
+        guard isAutomaticOutputPairingEnabled else {
+            return nil
+        }
+
         let result = outputSwitchCoordinator.applyPrediction(
             format: record.format,
             trackIdentity: trackIdentity,
@@ -319,6 +374,10 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let result,
               result.shouldRefreshOutputSnapshot else {
             return
+        }
+
+        if result.didApplyOutputChange {
+            markOutputTextFlashPending()
         }
 
         refreshOutputSnapshot()
@@ -362,12 +421,16 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        let shouldFlashOutputText = consumePendingOutputTextFlash()
         state.outputSampleRate = output.sampleRate
         state.outputBitDepth = output.bitDepth
         updateMenuBarTitle()
 
         if isMenuOpen {
             updateMenuLabels()
+            if shouldFlashOutputText {
+                flashOutputText()
+            }
         }
     }
 
@@ -415,10 +478,16 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func audioOutputDidChange() {
         let output = monitor.currentOutput()
+        let shouldFlashOutputText = (output.sampleRate != state.outputSampleRate
+            || output.bitDepth != state.outputBitDepth)
+            && consumePendingOutputTextFlash()
         var newState = state
         newState.outputSampleRate = output.sampleRate
         newState.outputBitDepth = output.bitDepth
         applyState(newState)
+        if shouldFlashOutputText, isMenuOpen {
+            flashOutputText()
+        }
     }
 
     private func updateMenuBarTitle() {
@@ -531,6 +600,7 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func populateMenu(_ menu: NSMenu) {
+        clearOutputTextFlashOverlays()
         menu.removeAllItems()
         menuLabels.removeAll()
         menuSlidingTextViews.removeAll()
@@ -572,6 +642,93 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menuSlidingTextViews["format-detail"]?.stringValue = formatText
         menuLabels["output-detail"]?.stringValue = outputText
         updateOutputPredictionIndicator()
+    }
+
+    private func markOutputTextFlashPending() {
+        pendingOutputTextFlash = true
+        pendingOutputTextFlashResetWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.pendingOutputTextFlash = false
+            }
+        }
+        pendingOutputTextFlashResetWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: workItem)
+    }
+
+    private func consumePendingOutputTextFlash() -> Bool {
+        guard pendingOutputTextFlash else {
+            return false
+        }
+
+        pendingOutputTextFlash = false
+        pendingOutputTextFlashResetWorkItem?.cancel()
+        pendingOutputTextFlashResetWorkItem = nil
+        return true
+    }
+
+    private func flashOutputText() {
+        outputTextFlashGeneration += 1
+        let generation = outputTextFlashGeneration
+        let duration: TimeInterval = 3.0
+
+        clearOutputTextFlashOverlays()
+        let overlays = ["output-title", "output-detail"]
+            .compactMap { key in
+                menuLabels[key].flatMap { outputTextFlashOverlay(for: $0) }
+            }
+        guard !overlays.isEmpty else {
+            return
+        }
+
+        outputTextFlashOverlays = overlays
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = duration
+            context.allowsImplicitAnimation = true
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            overlays.forEach { $0.animator().alphaValue = 0 }
+        } completionHandler: { [weak self] in
+            Task { @MainActor in
+                guard let self,
+                      self.outputTextFlashGeneration == generation else {
+                    return
+                }
+
+                self.clearOutputTextFlashOverlays()
+            }
+        }
+    }
+
+    private func outputTextFlashOverlay(for label: NSTextField) -> NSTextField? {
+        guard label.superview != nil else {
+            return nil
+        }
+
+        label.wantsLayer = true
+        let overlay = NSTextField(labelWithString: label.stringValue)
+        overlay.font = label.font
+        overlay.textColor = .systemBlue
+        overlay.lineBreakMode = label.lineBreakMode
+        overlay.maximumNumberOfLines = label.maximumNumberOfLines
+        overlay.alignment = label.alignment
+        overlay.alphaValue = 1
+        overlay.wantsLayer = true
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        label.addSubview(overlay)
+
+        NSLayoutConstraint.activate([
+            overlay.leadingAnchor.constraint(equalTo: label.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: label.trailingAnchor),
+            overlay.topAnchor.constraint(equalTo: label.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: label.bottomAnchor)
+        ])
+        return overlay
+    }
+
+    private func clearOutputTextFlashOverlays() {
+        outputTextFlashOverlays.forEach { $0.removeFromSuperview() }
+        outputTextFlashOverlays.removeAll()
     }
 
     private func updateOutputPredictionIndicator() {
@@ -726,7 +883,7 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             formatColumn.topAnchor.constraint(equalTo: contentView.topAnchor),
             outputColumn.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: MenuLayout.analysisColumnWidth + MenuLayout.columnSpacing),
             outputColumn.topAnchor.constraint(equalTo: contentView.topAnchor),
-            arrowView.leadingAnchor.constraint(equalTo: formatColumn.trailingAnchor, constant: 8),
+            arrowView.leadingAnchor.constraint(equalTo: formatColumn.trailingAnchor, constant: MenuLayout.formatOutputToggleHorizontalGap),
             arrowView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor)
         ])
 
@@ -832,17 +989,15 @@ final class IsLosslessApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func formatOutputArrowView() -> NSView {
-        let imageView = NSImageView()
-        imageView.image = NSImage(systemSymbolName: "arrow.right", accessibilityDescription: "포맷에서 출력")
-        imageView.image?.isTemplate = true
-        imageView.contentTintColor = .secondaryLabelColor
-        imageView.imageScaling = .scaleProportionallyDown
-        imageView.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            imageView.widthAnchor.constraint(equalToConstant: MenuLayout.formatOutputArrowWidth),
-            imageView.heightAnchor.constraint(equalToConstant: MenuLayout.analysisDetailRowHeight)
-        ])
-        return imageView
+        let toggleView = OutputPairingToggleView(
+            isOn: isAutomaticOutputPairingEnabled,
+            diameter: MenuLayout.formatOutputToggleDiameter,
+            arrowWidth: MenuLayout.formatOutputToggleArrowWidth
+        )
+        toggleView.onToggle = { [weak self] isOn in
+            self?.setAutomaticOutputPairingEnabled(isOn, reason: "menu-toggle")
+        }
+        return toggleView
     }
 
     private func fixedHeightRow(containing view: NSView, width: CGFloat) -> NSView {
@@ -1410,6 +1565,159 @@ final class SynchronizedSlidingGroup {
     }
 }
 
+private final class OutputPairingToggleView: NSControl {
+    private let imageView = NSImageView()
+    private let diameter: CGFloat
+    private let arrowWidth: CGFloat
+    private var trackingArea: NSTrackingArea?
+    private var isHovering = false {
+        didSet {
+            updateAppearance()
+        }
+    }
+
+    var isOn: Bool {
+        didSet {
+            updateAppearance()
+        }
+    }
+
+    var onToggle: ((Bool) -> Void)?
+
+    init(isOn: Bool, diameter: CGFloat, arrowWidth: CGFloat) {
+        self.isOn = isOn
+        self.diameter = diameter
+        self.arrowWidth = arrowWidth
+        super.init(frame: NSRect(x: 0, y: 0, width: diameter, height: diameter))
+
+        translatesAutoresizingMaskIntoConstraints = false
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentHuggingPriority(.required, for: .vertical)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .vertical)
+
+        wantsLayer = true
+
+        let symbolConfiguration = NSImage.SymbolConfiguration(pointSize: arrowWidth, weight: .bold)
+        let image = NSImage(systemSymbolName: "arrow.right", accessibilityDescription: "자동 출력 페어링")?
+            .withSymbolConfiguration(symbolConfiguration)
+        image?.isTemplate = true
+        imageView.image = image
+        imageView.imageScaling = .scaleProportionallyDown
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(imageView)
+
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: diameter),
+            heightAnchor.constraint(equalToConstant: diameter),
+            imageView.widthAnchor.constraint(equalToConstant: arrowWidth),
+            imageView.heightAnchor.constraint(equalToConstant: arrowWidth),
+            imageView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            imageView.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("자동 출력 페어링")
+        updateAppearance()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: diameter, height: diameter)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.cornerRadius = min(bounds.width, bounds.height) / 2
+        CATransaction.commit()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        self.trackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovering = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovering = false
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else {
+            return
+        }
+
+        toggle()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateAppearance()
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard isEnabled else {
+            return false
+        }
+
+        toggle()
+        return true
+    }
+
+    private func toggle() {
+        isOn.toggle()
+        onToggle?(isOn)
+    }
+
+    private func updateAppearance() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.backgroundColor = backgroundColor.cgColor
+        layer?.cornerRadius = diameter / 2
+        CATransaction.commit()
+
+        imageView.contentTintColor = isOn ? .white : .black
+        setAccessibilityValue(isOn ? "켬" : "끔")
+    }
+
+    private var backgroundColor: NSColor {
+        if isOn {
+            return NSColor.systemBlue.withAlphaComponent(isHovering ? 0.72 : 1)
+        }
+
+        return NSColor.systemGray.withAlphaComponent(isHovering ? 0.38 : 0.24)
+    }
+}
+
 private extension AudioOutputSwitchResult {
     var didApplyOutputChange: Bool {
         switch self {
@@ -1820,6 +2128,12 @@ final class AppleMusicMonitor {
             expiresAt: now.addingTimeInterval(stalePlaybackTickProtectionWindow)
         )
         loggedStaleTransitionQueueItemIDs.removeAll()
+    }
+
+    func clearAppliedPredictionState() {
+        predictionTransitionGuard = nil
+        loggedStaleTransitionQueueItemIDs.removeAll()
+        appliedPreloadPrediction = nil
     }
 
     func predictionState() -> PreloadPredictionState {
